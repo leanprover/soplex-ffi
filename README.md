@@ -14,8 +14,8 @@ System dependencies:
 
 | Platform | Packages |
 |----------|----------|
-| Linux    | `cmake ninja-build libgmp-dev libgmpxx4ldbl libboost-dev` |
-| macOS    | `brew install gmp boost cmake ninja` |
+| Linux    | `build-essential cmake libgmp-dev libgmpxx4ldbl libboost-dev` |
+| macOS    | `brew install gmp boost cmake` (plus Xcode Command Line Tools) |
 | Windows  | MSYS2 `mingw-w64-x86_64-{gcc,cmake,ninja,make,gmp,boost}` |
 
 ```bash
