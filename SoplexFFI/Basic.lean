@@ -18,6 +18,42 @@
 -/
 
 import SoplexFFI.Validate
+import Lean
+
+initialize
+  try
+    let olean ← Lean.findOLean `SoplexFFI.Basic
+    let some leanLibDir := olean.parent
+      | throw <| IO.userError s!"could not determine Lean library directory from {olean}"
+    let mut dir := leanLibDir
+    let mut libDir? := none
+    for _ in [0:20] do
+      if dir.fileName == some "lean" then
+        libDir? := dir.parent
+        break
+      else
+        match dir.parent with
+        | some parent => dir := parent
+        | none => pure ()
+    let some libDir := libDir?
+      | throw <| IO.userError s!"could not determine native library directory from {leanLibDir}"
+    let libNames :=
+      if System.Platform.isOSX then #["libsoplexffi.dylib"]
+      else if System.Platform.isWindows then #["soplexffi.dll", "libsoplexffi.dll"]
+      else #["libsoplexffi.so"]
+    let mut loaded := false
+    let mut lastError := ""
+    for libName in libNames do
+      try
+        Lean.loadDynlib (libDir / libName)
+        loaded := true
+        break
+      catch e =>
+        lastError := toString e
+    unless loaded do
+      throw <| IO.userError s!"could not load SoPlex FFI native library from {libDir}: {lastError}"
+  catch _ =>
+    pure ()
 
 namespace Soplex
 
@@ -48,7 +84,7 @@ opaque exceptionCheck : Unit → UInt32
 /-- Result of `ffiCheckSolve`. `ret` follows the FFI layer convention:
     `0` = optimal, `1` = infeasible, `2` = unbounded, anything else is an
     FFI / SoPlex error. -/
-structure FfiCheckResult where
+structure FFICheckResult where
   /-- Primal solution (length = `numVars`). Meaningful iff `ret = 0`. -/
   primal : FloatArray
   /-- Return code; see structure docstring. -/
@@ -61,7 +97,7 @@ deriving Inhabited
 private opaque ffiCheckSolveImpl
     (c : @& FloatArray) (b : @& FloatArray)
     (aRows : @& ByteArray) (aCols : @& ByteArray) (aVals : @& FloatArray) :
-    FfiCheckResult
+    FFICheckResult
 
 /-- Pack a `UInt32` little-endian onto a `ByteArray`. -/
 @[inline] private def pushU32LE (bs : ByteArray) (u : UInt32) : ByteArray :=
@@ -397,7 +433,7 @@ runtime pipeline on every supported platform.
 def ffiCheckSolve
     (c : Array Float) (b : Array Float)
     (rows : Array UInt32) (cols : Array UInt32) (vals : Array Float) :
-    FfiCheckResult :=
+    FFICheckResult :=
   ffiCheckSolveImpl
     (floatArrayOfArray c) (floatArrayOfArray b)
     (packUInt32Array rows) (packUInt32Array cols)

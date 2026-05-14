@@ -31,6 +31,12 @@
 
 #include "lean_soplex.h"
 
+#ifdef _WIN32
+#define SOPLEXFFI_INTERP_EXPORT LEAN_EXPORT
+#else
+#define SOPLEXFFI_INTERP_EXPORT LEAN_EXPORT __attribute__((weak))
+#endif
+
 using namespace soplex;
 
 /*
@@ -681,6 +687,79 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
   }
 }
 
+extern "C" SOPLEXFFI_INTERP_EXPORT lean_obj_res
+lp_SoplexFFI___private_SoplexFFI_Basic_0__Soplex_solveExactFlat___boxed(
+    lean_object** args) {
+  lean_object* m = args[0];
+  lean_object* n = args[1];
+  lean_object* numVarsObj = args[2];
+  lean_object* numConstraintsObj = args[3];
+  lean_object* senseObj = args[4];
+  lean_object* simplexObj = args[5];
+  lean_object* hasTimeLimitObj = args[6];
+  lean_object* timeLimitObj = args[7];
+  lean_object* hasIterLimitObj = args[8];
+  lean_object* iterLimitObj = args[9];
+  lean_object* verboseObj = args[10];
+  lean_object* randomSeedObj = args[11];
+  lean_object* precisionBoostObj = args[12];
+  lean_object* presolveObj = args[13];
+  lean_object* c = args[14];
+  lean_object* objOffset = args[15];
+  lean_object* aRows = args[16];
+  lean_object* aCols = args[17];
+  lean_object* aVals = args[18];
+  lean_object* rowLoMask = args[19];
+  lean_object* rowLo = args[20];
+  lean_object* rowHiMask = args[21];
+  lean_object* rowHi = args[22];
+  lean_object* colLoMask = args[23];
+  lean_object* colLo = args[24];
+  lean_object* colHiMask = args[25];
+  lean_object* colHi = args[26];
+
+  uint32_t numVars = lean_unbox_uint32(numVarsObj);
+  lean_dec(numVarsObj);
+  uint32_t numConstraints = lean_unbox_uint32(numConstraintsObj);
+  lean_dec(numConstraintsObj);
+  uint8_t sense = lean_unbox(senseObj);
+  uint8_t simplex = lean_unbox(simplexObj);
+  uint8_t hasTimeLimit = lean_unbox(hasTimeLimitObj);
+  double timeLimit = lean_unbox_float(timeLimitObj);
+  lean_dec_ref(timeLimitObj);
+  uint8_t hasIterLimit = lean_unbox(hasIterLimitObj);
+  uint32_t iterLimit = lean_unbox_uint32(iterLimitObj);
+  lean_dec(iterLimitObj);
+  uint8_t verbose = lean_unbox(verboseObj);
+  uint32_t randomSeed = lean_unbox_uint32(randomSeedObj);
+  lean_dec(randomSeedObj);
+  uint8_t precisionBoost = lean_unbox(precisionBoostObj);
+  uint8_t presolve = lean_unbox(presolveObj);
+
+  lean_object* ret = lean_soplex_solve_exact(
+      m, n, numVars, numConstraints, sense, simplex,
+      hasTimeLimit, timeLimit, hasIterLimit, iterLimit,
+      verbose, randomSeed, precisionBoost, presolve,
+      c, objOffset, aRows, aCols, aVals,
+      rowLoMask, rowLo, rowHiMask, rowHi,
+      colLoMask, colLo, colHiMask, colHi);
+
+  lean_dec_ref(colHi);
+  lean_dec_ref(colHiMask);
+  lean_dec_ref(colLo);
+  lean_dec_ref(colLoMask);
+  lean_dec_ref(rowHi);
+  lean_dec_ref(rowHiMask);
+  lean_dec_ref(rowLo);
+  lean_dec_ref(rowLoMask);
+  lean_dec_ref(aVals);
+  lean_dec_ref(aCols);
+  lean_dec_ref(aRows);
+  lean_dec_ref(objOffset);
+  lean_dec_ref(c);
+  return ret;
+}
+
 /*
  * Build a `some : Float → Option Float` Lean value. `Option` is a
  * universe-polymorphic inductive, so its data argument is always
@@ -858,7 +937,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_ffi_check_solve_ffi(
       &objval);
 
   /*
-   * Layout for `Soplex.FfiCheckResult`:
+   * Layout for `Soplex.FFICheckResult`:
    *   primal : FloatArray   -- object field
    *   ret    : UInt32       -- scalar field
    *   obj    : Float        -- scalar field
