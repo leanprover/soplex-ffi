@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install GMP / Boost / CMake / build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build clang \
+            libgmp-dev libgmpxx4ldbl libboost-dev \
+            libc++-dev libc++abi-dev \
+            zstd
+
+      - name: Install elan and Lean toolchain
+        shell: bash
+        run: |
+          set -e
+          if ! command -v elan >/dev/null 2>&1; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+            sh elan-init.sh -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          ./scripts/install-toolchain.sh
+
+      - name: Build and run ffi-check
+        run: lake exe ffi-check
+
+  linux-asan:
+    name: Linux ASan/UBSan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1:abort_on_error=1:symbolize=1:print_stacktrace=1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install GMP / Boost / CMake / build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build clang llvm \
+            libgmp-dev libgmpxx4ldbl libboost-dev \
+            libc++-dev libc++abi-dev \
+            zstd
+
+      - name: Install elan and Lean toolchain
+        shell: bash
+        run: |
+          set -e
+          if ! command -v elan >/dev/null 2>&1; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+            sh elan-init.sh -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          ./scripts/install-toolchain.sh
+
+      - name: Plant compiler-rt sanitizer archives into Lean's clang
+        run: ./scripts/install-sanitizer-runtime.sh
+
+      - name: Preload ASan runtime for Lean
+        run: |
+          asan_so="$(find "$(lean --print-prefix)/lib/clang" \
+            -path '*/lib/x86_64-unknown-linux-gnu/libclang_rt.asan.so' \
+            | sort -V | tail -1)"
+          if [ -z "$asan_so" ]; then
+            echo "Could not find libclang_rt.asan.so under Lean's clang resource directory" >&2
+            exit 1
+          fi
+          echo "LD_PRELOAD=$asan_so" >> "$GITHUB_ENV"
+          echo "Using ASAN runtime: $asan_so"
+
+      - name: Build and run ffi-check under ASan/UBSan
+        run: lake -Ksanitize=1 exe ffi-check
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install GMP / Boost / build tools
+        run: brew install gmp boost cmake ninja zstd
+
+      - name: Ensure CLT SDK symlink
+        run: |
+          sdk_path="$(xcrun --show-sdk-path)"
+          target="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+          if [ ! -d "$target" ]; then
+            sudo mkdir -p "$(dirname "$target")"
+            sudo ln -sfn "$sdk_path" "$target"
+          fi
+
+      - name: Install elan and Lean toolchain
+        shell: bash
+        run: |
+          set -e
+          if ! command -v elan >/dev/null 2>&1; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+            sh elan-init.sh -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          ./scripts/install-toolchain.sh
+
+      - name: Build and run ffi-check
+        run: lake exe ffi-check
+
+  windows:
+    name: Windows (MSYS2 / mingw-w64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-boost
+            git
+            curl
+            unzip
+
+      - name: Install elan and Lean toolchain
+        run: |
+          set -e
+          curl -sSf -L https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-pc-windows-msvc.zip -o elan-init.zip
+          unzip -q elan-init.zip
+          MSYS2_ARG_CONV_EXCL="*" ./elan-init.exe -y --default-toolchain none --no-modify-path
+          ELAN_DIR_MSYS="$(cygpath -u "$USERPROFILE")/.elan"
+          export PATH="$ELAN_DIR_MSYS/bin:$MINGW_PREFIX/bin:$PATH"
+          ./scripts/install-toolchain.sh
+          echo "$ELAN_DIR_MSYS/bin" > .elan-path
+          echo "$MINGW_PREFIX/bin" >> .elan-path
+
+      - name: Build and run ffi-check
+        run: |
+          set -e
+          export PATH="$(paste -sd: .elan-path):$PATH"
+          lake exe ffi-check

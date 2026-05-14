@@ -1,7 +1,7 @@
 import Lake
 open System Lake DSL
 
-/-! # `soplex-ffi` build configuration
+/-! # `SoplexFFI` build configuration
 
   This package owns the direct SoPlex binding: the vendored SoPlex
   build, the C++ bridge, and the thin Lean API in `SoplexFFI`.
@@ -55,7 +55,7 @@ def soplexRuntimeLinkArgs : Array String :=
       "-lgmpxx", "-lgmp",
       "-lm"] ++ sanitizerArgs
 
-package soplexFfi where
+package SoplexFFI where
   moreLinkArgs := soplexRuntimeLinkArgs
 
 def soplexObjsDir (pkgDir : FilePath) : FilePath :=
@@ -69,8 +69,8 @@ def soplexReadyFile (pkgDir : FilePath) : FilePath :=
 
 def soplexSubmoduleHelp (srcDir : FilePath) : String :=
   s!"SoPlex submodule not found at {srcDir}.\n" ++
-  "Run `git submodule update --init --recursive` from the repo root, " ++
-  "or clone with `git clone --recurse-submodules`."
+  "Run `git submodule update --init --recursive`, or clone with " ++
+  "`git clone --recurse-submodules`."
 
 def isSoplexInput (path : FilePath) : Bool :=
   match path.extension with
@@ -134,12 +134,21 @@ def listObjectFiles (dir : FilePath) : IO (Array FilePath) := do
       out := out.push e.path
   pure out
 
-def buildSoplexObjects (pkgDir : FilePath) : JobM Unit := do
+def ensureSoplexSubmodule (pkgDir : FilePath) : JobM Unit := do
   let srcDir := pkgDir / "vendor" / "soplex"
   let cmakeFile := srcDir / "CMakeLists.txt"
   if !(← cmakeFile.pathExists) then
+    let gitmodules := pkgDir / ".gitmodules"
+    if (← gitmodules.pathExists) then
+      logInfo "SoPlex submodule missing; running `git submodule update --init --recursive`."
+      proc {cmd := "git", args := #["submodule", "update", "--init", "--recursive"], cwd := some pkgDir}
+  if !(← cmakeFile.pathExists) then
     logWarning <| soplexSubmoduleHelp srcDir
     error <| soplexSubmoduleHelp srcDir
+
+def buildSoplexObjects (pkgDir : FilePath) : JobM Unit := do
+  ensureSoplexSubmodule pkgDir
+  let srcDir := pkgDir / "vendor" / "soplex"
   stageMingwLibs pkgDir
   let buildDir := soplexBuildDir pkgDir
   let objsDir := soplexObjsDir pkgDir
@@ -185,7 +194,7 @@ private def soplexObjectsTarget (pkg : Package) : FetchM (Job FilePath) := do
     if (← cmakeFile.pathExists) then
       inputDir srcDir (text := false) isSoplexInput
     else
-      (← inputTextFile (pkg.dir / ".." / ".gitmodules")).mapM fun p => pure #[p]
+      (← inputTextFile (pkg.dir / ".gitmodules")).mapM fun p => pure #[p]
   buildFileAfterDep (soplexReadyFile pkg.dir) srcTarget fun _ => do
     addPlatformTrace
     addPureTrace sanitizerEnabled "sanitize"
@@ -208,12 +217,14 @@ def bridgeStdlibArgs : Array String :=
   if System.Platform.isOSX ∨ System.Platform.isWindows then #[]
   else #["-stdlib=libc++"]
 
-private def bridgeOTarget (pkg : Package) (src : String) :
+private def bridgeOTarget (pkg : Package) (soplexReady : Job FilePath) (src : String) :
     FetchM (Job FilePath) := do
   let stem := src.dropEnd 4
   let oFile := pkg.dir / defaultBuildDir / "ffi" / s!"{stem}.o"
   let srcTarget ← inputTextFile <| pkg.dir / "ffi" / src
-  buildFileAfterDep oFile srcTarget fun srcFile => do
+  let deps := Job.collectArray #[srcTarget, soplexReady] "bridge inputs"
+  buildFileAfterDep oFile deps fun depFiles => do
+    let srcFile := depFiles[0]!
     let leanInc        := (← getLeanIncludeDir).toString
     let ffiInc         := (pkg.dir / "ffi").toString
     let soplexSrcInc   := (pkg.dir / "vendor" / "soplex" / "src").toString
@@ -230,7 +241,7 @@ extern_lib soplexffi (pkg) := do
   let name := nameToStaticLib "soplexffi"
   let outLib := pkg.staticLibDir / name
   let soplexReady ← soplexObjectsTarget pkg
-  let bridgeOJobs ← bridgeSrcs.mapM (bridgeOTarget pkg)
+  let bridgeOJobs ← bridgeSrcs.mapM (bridgeOTarget pkg soplexReady)
   let bridgeOsJob := Job.collectArray bridgeOJobs "bridge objs"
   soplexReady.mapM fun _ => do
     let soplexOs ← listSoplexObjs pkg.dir
@@ -245,3 +256,6 @@ lean_lib SoplexFFI where
   globs := #[`SoplexFFI, `SoplexFFI.Basic, `SoplexFFI.Types, `SoplexFFI.Validate]
   precompileModules := !sanitizerEnabled
   moreLinkArgs := soplexRuntimeLinkArgs
+
+lean_exe «ffi-check» where
+  root := `Main

@@ -1,5 +1,5 @@
 /-
-  FFI surface for `lean-soplex`.
+  FFI surface for `SoplexFFI`.
 
   This file exposes the SoPlex-backed entry points:
 

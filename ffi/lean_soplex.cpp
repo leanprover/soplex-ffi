@@ -44,7 +44,7 @@ extern "C" int lean_soplex_version(void) {
  *   3  no exception escaped the `throw` (unreachable in a working build)
  */
 extern "C" int lean_soplex_exception_check(void) {
-  static const char *msg = "lean-soplex exception throw/catch test";
+  static const char *msg = "SoplexFFI exception throw/catch test";
   try {
     throw std::runtime_error(msg);
   } catch (const std::exception &e) {
