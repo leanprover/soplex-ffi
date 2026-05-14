@@ -477,6 +477,58 @@ static std::vector<Mpq> split_pos(const std::vector<Mpq> &signedVals, bool posit
   return out;
 }
 
+// Mask-aware Farkas routing: send a signed Farkas multiplier vector into
+// the (lower, upper) slots of `DualBundle`, consulting the bound mask so
+// one-sided rows always populate the slot that actually has a bound.
+//
+// Why not just split by sign (`split_pos`)? SoPlex's `getDualFarkasRational`
+// returns POSITIVE multipliers for one-sided constraints regardless of
+// which bound side they refer to (positive both for `Ax ≤ hi` and
+// `Ax ≥ lo` infeasibilities). For ranged constraints (both bounds
+// present), the sign indicates the binding side: positive→lower,
+// negative→upper. Pure sign-based routing breaks the one-sided-upper
+// case (positive multipliers wrongly land in `rowLower`, where the
+// `DualBundle` contract requires zero).
+//
+// The verifier (`Soplex/Verify/Bool.lean`) requires:
+//   * `lower[i] = 0` if row `i` has no lower bound, and similarly for
+//     upper;
+//   * all multipliers `≥ 0`.
+// Both invariants are preserved here by routing to the present side and
+// taking the absolute value.
+static void route_farkas_by_mask(
+    const std::vector<Mpq> &signedY,
+    b_lean_obj_arg loMask, b_lean_obj_arg hiMask,
+    std::vector<Mpq> &outLower, std::vector<Mpq> &outUpper) {
+  size_t n = signedY.size();
+  init_mpq_vector(outLower, n);
+  init_mpq_vector(outUpper, n);
+  for (size_t i = 0; i < n; ++i) {
+    int sign = mpq_sgn(signedY[i].q);
+    if (sign == 0) continue;
+    bool hasLo = byte_array_u8(loMask, i);
+    bool hasHi = byte_array_u8(hiMask, i);
+    if (hasLo && hasHi) {
+      // Ranged: SoPlex's signed convention is positive→lower, negative→upper.
+      if (sign > 0) {
+        mpq_set(outLower[i].q, signedY[i].q);
+      } else {
+        mpq_set(outUpper[i].q, signedY[i].q);
+        mpq_neg(outUpper[i].q, outUpper[i].q);
+      }
+    } else if (hasLo) {
+      // One-sided lower: take the magnitude into rowLower.
+      mpq_set(outLower[i].q, signedY[i].q);
+      if (sign < 0) mpq_neg(outLower[i].q, outLower[i].q);
+    } else if (hasHi) {
+      // One-sided upper: take the magnitude into rowUpper.
+      mpq_set(outUpper[i].q, signedY[i].q);
+      if (sign < 0) mpq_neg(outUpper[i].q, outUpper[i].q);
+    }
+    // Free row (no bounds): contribution must be zero — leave as zero.
+  }
+}
+
 static void negate_all(std::vector<Mpq> &xs) {
   for (auto &x : xs) mpq_neg(x.q, x.q);
 }
@@ -641,10 +693,9 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
           negate_all(y);
           negate_all(aty);
         }
-        auto rowLower = split_pos(y, true);
-        auto rowUpper = split_pos(y, false);
-        auto colLower = split_pos(aty, true);
-        auto colUpper = split_pos(aty, false);
+        std::vector<Mpq> rowLower, rowUpper, colLower, colUpper;
+        route_farkas_by_mask(y, rowLoMask, rowHiMask, rowLower, rowUpper);
+        route_farkas_by_mask(aty, colLoMask, colHiMask, colLower, colUpper);
         dual = mk_some(mk_dual_bundle(rowLower, rowUpper, colLower, colUpper));
         break;
       }
