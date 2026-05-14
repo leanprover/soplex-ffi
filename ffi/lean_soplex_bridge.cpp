@@ -906,6 +906,10 @@ static lean_object *mk_nat_from_int(int n) {
   return lean_unsigned_to_nat(static_cast<unsigned>(n));
 }
 
+static lean_object *mk_fin_from_int(int n) {
+  return mk_nat_from_int(n);
+}
+
 static lean_object *mk_prod2(lean_object *a, lean_object *b) {
   lean_object *p = lean_alloc_ctor(0, 2, 0);
   lean_ctor_set(p, 0, a);
@@ -952,7 +956,7 @@ static lean_object *mk_opt_rat(const std::string &s, bool present) {
 //
 //   c              : Vector Rat n         (runtime: Array Rat)
 //   objOffset      : Rat
-//   a              : Array (Nat × Nat × Rat)
+//   a              : Array (Fin m × Fin n × Rat)
 //   rowBounds      : Vector (Option Rat × Option Rat) m   (Array layout)
 //   colBounds      : Vector (Option Rat × Option Rat) n   (Array layout)
 static lean_object *mk_problem(
@@ -1056,8 +1060,8 @@ static lean_object *problem_from_lp(SPxLPRat &lp) {
   for (size_t k = 0; k < nnz; ++k) {
     const auto &e = entries[k];
     lean_object *triple = mk_prod2(
-        mk_nat_from_int(std::get<0>(e)),
-        mk_prod2(mk_nat_from_int(std::get<1>(e)),
+        mk_fin_from_int(std::get<0>(e)),
+        mk_prod2(mk_fin_from_int(std::get<1>(e)),
                  mk_rat_from_string(std::get<2>(e))));
     lean_array_cptr(aArr)[k] = triple;
   }

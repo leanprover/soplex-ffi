@@ -5,7 +5,7 @@
   reaches the FFI or the certificate checker. It guarantees:
 
   * Every array field has the declared length.
-  * Every sparse entry's `(row, col)` is in range.
+  * Sparse entry `(row, col)` bounds are carried by `Fin` indices.
   * Every bound pair has `lo ≤ hi`.
   * Sparse entries are sorted by `(row, col)`.
   * Duplicate `(row, col)` entries are summed.
@@ -43,39 +43,66 @@ def validateOptions (o : Options) : Except OptionError Options := do
 
 /-! ## `validate`. -/
 
+private def finEntryOfRaw {numConstraints numVars : Nat}
+    (entry : Nat × Nat × Rat) :
+    Except ProblemError (Fin numConstraints × Fin numVars × Rat) := do
+  let (r, c, v) := entry
+  if hr : r < numConstraints then
+    if hc : c < numVars then
+      pure (⟨r, hr⟩, ⟨c, hc⟩, v)
+    else
+      throw (.indexOutOfRange .col c numVars)
+  else
+    throw (.indexOutOfRange .row r numConstraints)
+
+def Problem.ofRaw {numConstraints numVars : Nat}
+    (p : RawProblem numConstraints numVars) :
+    Except ProblemError (Problem numConstraints numVars) := do
+  let a ← p.a.mapM finEntryOfRaw
+  pure {
+    c := p.c
+    objOffset := p.objOffset
+    a := a
+    rowBounds := p.rowBounds
+    colBounds := p.colBounds
+  }
+
 /-- Compare `(row, col)` pairs lexicographically. -/
-@[inline] private def entryLt (x y : Nat × Nat × Rat) : Bool :=
+@[inline] private def entryLt {m n : Nat}
+    (x y : Fin m × Fin n × Rat) : Bool :=
   let (r₁, c₁, _) := x
   let (r₂, c₂, _) := y
-  r₁ < r₂ || (r₁ = r₂ && c₁ < c₂)
+  r₁.val < r₂.val || (r₁ = r₂ && c₁.val < c₂.val)
 
 /-- Sum consecutive equal-key entries in a sorted sparse list, drop
     zero results, and return the normalised array. Assumes input is
     already sorted by `entryLt`. -/
-private def collapseSorted (a : Array (Nat × Nat × Rat)) :
-    Array (Nat × Nat × Rat) := Id.run do
-  if a.isEmpty then return #[]
-  let mut out : Array (Nat × Nat × Rat) := Array.mkEmpty a.size
-  let mut curR : Nat := (a[0]!).1
-  let mut curC : Nat := ((a[0]!).2).1
-  let mut curV : Rat := ((a[0]!).2).2
-  for i in [1:a.size] do
-    let (r, c, v) := a[i]!
-    if r = curR && c = curC then
-      curV := curV + v
-    else
+private def collapseSorted {m n : Nat} (a : Array (Fin m × Fin n × Rat)) :
+    Array (Fin m × Fin n × Rat) :=
+  match a.toList with
+  | [] => #[]
+  | first :: rest => Id.run do
+      let mut out : Array (Fin m × Fin n × Rat) := Array.mkEmpty a.size
+      let mut curR : Fin m := first.1
+      let mut curC : Fin n := first.2.1
+      let mut curV : Rat := first.2.2
+      for entry in rest do
+        let (r, c, v) := entry
+        if r = curR && c = curC then
+          curV := curV + v
+        else
+          if curV ≠ 0 then
+            out := out.push (curR, curC, curV)
+          curR := r
+          curC := c
+          curV := v
       if curV ≠ 0 then
         out := out.push (curR, curC, curV)
-      curR := r
-      curC := c
-      curV := v
-  if curV ≠ 0 then
-    out := out.push (curR, curC, curV)
-  return out
+      return out
 
 /-- Normalise the sparse matrix: sort, sum duplicates, drop zeros. -/
-private def normaliseSparse (a : Array (Nat × Nat × Rat)) :
-    Array (Nat × Nat × Rat) :=
+private def normaliseSparse {m n : Nat} (a : Array (Fin m × Fin n × Rat)) :
+    Array (Fin m × Fin n × Rat) :=
   collapseSorted (a.qsort entryLt)
 
 /-- Validate and normalise a `Problem`.
@@ -86,10 +113,6 @@ private def normaliseSparse (a : Array (Nat × Nat × Rat)) :
     checker can both assume well-formed inputs without re-validating. -/
 def validate {numConstraints numVars : Nat} (p : Problem numConstraints numVars) :
     Except ProblemError (Problem numConstraints numVars) := do
-  -- Length checks for `c`, `colBounds`, `rowBounds` are no longer
-  -- needed: `Problem`'s `Vector` fields make wrong-length values
-  -- unconstructible. `ProblemError.wrongLength` is retained in the
-  -- error type for source compatibility but never thrown.
   -- Bound inversions for columns.
   for i in [0:p.colBounds.toArray.size] do
     match p.colBounds.toArray[i]! with
@@ -102,14 +125,15 @@ def validate {numConstraints numVars : Nat} (p : Problem numConstraints numVars)
     | (some lo, some hi) =>
       if lo > hi then throw (.boundInverted .row i lo hi)
     | _ => pure ()
-  -- Sparse-entry range checks.
-  for k in [0:p.a.size] do
-    let (r, c, _) := p.a[k]!
-    if r ≥ numConstraints then
-      throw (.indexOutOfRange .row r numConstraints)
-    if c ≥ numVars then
-      throw (.indexOutOfRange .col c numVars)
   let a' := normaliseSparse p.a
   pure { p with a := a' }
+
+/-- Convert raw natural sparse indices to `Fin` once at the boundary,
+    then validate and normalise the resulting typed problem. -/
+def validateRaw {numConstraints numVars : Nat}
+    (p : RawProblem numConstraints numVars) :
+    Except ProblemError (Problem numConstraints numVars) := do
+  let p ← Problem.ofRaw p
+  validate p
 
 end Soplex

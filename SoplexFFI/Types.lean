@@ -44,10 +44,11 @@ structure Options where
 
 /-- LP problem in canonical sparse form.
 
-    Sparse `a` entries are `(row, col, value)`, 0-indexed. `validate`
-    normalises this representation: duplicate `(row, col)` entries are
-    summed, zero values are dropped, entries are sorted by `(row, col)`.
-    The verifier always runs against the post-`validate` form. -/
+    Sparse `a` entries are `(row, col, value)`, with row and column
+    indices carrying their bounds in the type. `validate` normalises
+    this representation: duplicate `(row, col)` entries are summed, zero
+    values are dropped, entries are sorted by `(row, col)`. The verifier
+    always runs against the post-`validate` form. -/
 structure Problem (numConstraints numVars : Nat) where
   /-- Objective coefficients (length = `numVars`). All zero ⇒ pure
       feasibility. -/
@@ -55,12 +56,39 @@ structure Problem (numConstraints numVars : Nat) where
   /-- Optional constant added to the objective. -/
   objOffset      : Rat := 0
   /-- Sparse constraint matrix entries: `(row, col, value)`, 0-indexed.
+      The `Fin` indices rule out out-of-range entries by construction.
       Normalised by `validate`. -/
-  a              : Array (Nat × Nat × Rat)
+  a              : Array (Fin numConstraints × Fin numVars × Rat)
   /-- Per-row bounds `(lo, hi)`; `none` = ±∞. Covers ≤, =, ≥, and
       ranged constraints uniformly. -/
   rowBounds      : Vector (Option Rat × Option Rat) numConstraints
   /-- Per-variable bounds `(lo, hi)`; `none` = ±∞. -/
+  colBounds      : Vector (Option Rat × Option Rat) numVars
+  deriving Repr
+
+namespace Problem
+
+/-- Literal-friendly sparse-entry constructor. Unlike Lean's modular
+    `OfNat (Fin n)` instance, the default proof obligation rejects
+    out-of-range numerals with `by decide`. Non-literal indices can pass
+    an explicit proof such as `by omega`. -/
+def entry {numConstraints numVars : Nat} (row col : Nat) (value : Rat)
+    (hrow : row < numConstraints := by decide)
+    (hcol : col < numVars := by decide) :
+    Fin numConstraints × Fin numVars × Rat :=
+  (⟨row, hrow⟩, ⟨col, hcol⟩, value)
+
+end Problem
+
+/-- Raw sparse problem shape for parser / FFI boundaries that still
+    receive natural row and column indices from outside Lean. Use
+    `validateRaw` to convert the sparse entries to `Fin` indices and
+    then normalise the resulting `Problem`. -/
+structure RawProblem (numConstraints numVars : Nat) where
+  c              : Vector Rat numVars
+  objOffset      : Rat := 0
+  a              : Array (Nat × Nat × Rat)
+  rowBounds      : Vector (Option Rat × Option Rat) numConstraints
   colBounds      : Vector (Option Rat × Option Rat) numVars
   deriving Repr
 

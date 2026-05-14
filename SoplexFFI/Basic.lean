@@ -140,8 +140,8 @@ private def problemFlatten {m n : Nat} (p : Problem m n) :
     Except ProblemError ProblemFlat := do
   let numVars ← checkedU32 "numVars" n
   let numConstraints ← checkedU32 "numConstraints" m
-  let rows ← p.a.mapM (fun e => checkedU32 "sparse row index" e.1)
-  let cols ← p.a.mapM (fun e => checkedU32 "sparse column index" e.2.1)
+  let rows ← p.a.mapM (fun e => checkedU32 "sparse row index" e.1.val)
+  let cols ← p.a.mapM (fun e => checkedU32 "sparse column index" e.2.1.val)
   let vals  := p.a.map (fun e => e.2.2)
   let rowLo := p.rowBounds.map Prod.fst
   let rowHi := p.rowBounds.map Prod.snd
