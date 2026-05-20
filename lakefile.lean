@@ -67,6 +67,28 @@ def soplexBuildDir (pkgDir : FilePath) : FilePath :=
 def soplexReadyFile (pkgDir : FilePath) : FilePath :=
   soplexObjsDir pkgDir / ".ready"
 
+def soplexBuildLockFile (pkgDir : FilePath) : FilePath :=
+  soplexObjsDir pkgDir / ".build.lock"
+
+def soplexReadyModified? (pkgDir : FilePath) : IO (Option IO.FS.SystemTime) := do
+  let marker := soplexReadyFile pkgDir
+  if (← marker.pathExists) then
+    return some (← marker.metadata).modified
+  else
+    return none
+
+def soplexReadyChangedSince (pkgDir : FilePath) (before? : Option IO.FS.SystemTime) : IO Bool := do
+  match before?, (← soplexReadyModified? pkgDir) with
+  | none, some _ => return true
+  | some before, some after => return before != after
+  | _, _ => return false
+
+def procSilentUnlessError (args : IO.Process.SpawnArgs) : LogIO Unit := do
+  let out ← rawProc args (quiet := true)
+  if out.exitCode != 0 then
+    logOutput out logInfo
+    error s!"external command '{args.cmd}' exited with code {out.exitCode}"
+
 def soplexSubmoduleHelp (srcDir : FilePath) : String :=
   s!"SoPlex submodule not found at {srcDir}.\n" ++
   "Run `git submodule update --init --recursive`, or clone with " ++
@@ -140,13 +162,24 @@ def ensureSoplexSubmodule (pkgDir : FilePath) : JobM Unit := do
   if !(← cmakeFile.pathExists) then
     let gitmodules := pkgDir / ".gitmodules"
     if (← gitmodules.pathExists) then
-      logInfo "SoPlex submodule missing; running `git submodule update --init --recursive`."
-      proc {cmd := "git", args := #["submodule", "update", "--init", "--recursive"], cwd := some pkgDir}
+      logVerbose "SoPlex submodule missing; running `git submodule update --init --recursive`."
+      procSilentUnlessError {
+        cmd := "git",
+        args := #["submodule", "update", "--init", "--recursive"],
+        cwd := some pkgDir
+      }
   if !(← cmakeFile.pathExists) then
     logWarning <| soplexSubmoduleHelp srcDir
     error <| soplexSubmoduleHelp srcDir
 
 def buildSoplexObjects (pkgDir : FilePath) : JobM Unit := do
+  let readyBefore? ← soplexReadyModified? pkgDir
+  -- Lake may replay this target's log through multiple dependents. The lock
+  -- keeps any duplicate jobs from rerunning CMake after one has produced
+  -- fresh objects for the same build wave.
+  Lake.withLockFile (soplexBuildLockFile pkgDir) do
+  if (← soplexReadyChangedSince pkgDir readyBefore?) then
+    return
   ensureSoplexSubmodule pkgDir
   let srcDir := pkgDir / "vendor" / "soplex"
   stageMingwLibs pkgDir
@@ -166,9 +199,9 @@ def buildSoplexObjects (pkgDir : FilePath) : JobM Unit := do
     "-DBUILD_TESTING=OFF",
     "-DZLIB=OFF"
   ]
-  proc {cmd := "cmake", args := cmakeArgs, cwd := some pkgDir, env := env}
+  procSilentUnlessError {cmd := "cmake", args := cmakeArgs, cwd := some pkgDir, env := env}
   let buildArgs := #["--build", buildDir.toString, "--target", "libsoplex", "--parallel"]
-  proc {cmd := "cmake", args := buildArgs, cwd := some pkgDir, env := env}
+  procSilentUnlessError {cmd := "cmake", args := buildArgs, cwd := some pkgDir, env := env}
   let lib := buildDir / "lib" / "libsoplex.a"
   if !(← lib.pathExists) then
     error s!"SoPlex archive was not produced at {lib}"
