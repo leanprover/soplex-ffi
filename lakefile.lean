@@ -5,7 +5,15 @@ open System Lake DSL
 
   This package owns the direct SoPlex binding: the vendored SoPlex
   build, the C++ bridge, and the thin Lean API in `SoplexFFI`.
+
+  The shared LP type vocabulary (`Problem`, `Options`, `Solution`,
+  `Certificate`, `SolveError`) and the pure-Lean validators live in
+  `kim-em/lp-core`; `SoplexFFI.Types` and `SoplexFFI.Validate`
+  re-export from there so existing consumers keep working.
 -/
+
+require LPCore from git "https://github.com/kim-em/lp-core" @
+  "60fca2313ea3be14f578258dc6390f2fa07b26e7"
 
 def macSdkPath : String :=
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
