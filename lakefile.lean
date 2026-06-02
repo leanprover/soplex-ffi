@@ -284,7 +284,13 @@ extern_lib soplexffi (pkg) := do
   let soplexReady ← soplexObjectsTarget pkg
   let bridgeOJobs ← bridgeSrcs.mapM (bridgeOTarget pkg soplexReady)
   let bridgeOsJob := Job.collectArray bridgeOJobs "bridge objs"
-  soplexReady.mapM fun _ => do
+  -- The static lib must relink whenever the SoPlex objects OR a bridge `.o`
+  -- changes. `buildArtifactUnlessUpToDate` keys on the ambient job trace
+  -- (`getTrace`), so the artifact job must depend on the bridge objects too —
+  -- mapping over `soplexReady` alone left the `.a` stale when only a bridge
+  -- source changed (the `.o` rebuilt but the archive was replayed from cache).
+  let inputsJob := Job.collectArray (#[soplexReady] ++ bridgeOJobs) "soplexffi inputs"
+  inputsJob.mapM fun _ => do
     let soplexOs ← listSoplexObjs pkg.dir
     let bridgeOs ← bridgeOsJob.await
     let art ← buildArtifactUnlessUpToDate outLib (ext := "a") (restore := true) do
