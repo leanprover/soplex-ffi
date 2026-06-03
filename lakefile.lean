@@ -13,7 +13,7 @@ open System Lake DSL
 -/
 
 require LPCore from git "https://github.com/kim-em/lp-core" @
-  "60fca2313ea3be14f578258dc6390f2fa07b26e7"
+  "8b694db5f88c65b06714de5488edefd238185f60"
 
 def macSdkPath : String :=
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"

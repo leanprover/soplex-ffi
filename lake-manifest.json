@@ -1,15 +1,16 @@
-{"version": "1.1.0",
+{"version": "1.2.0",
  "packagesDir": ".lake/packages",
  "packages":
  [{"url": "https://github.com/kim-em/lp-core",
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "60fca2313ea3be14f578258dc6390f2fa07b26e7",
+   "rev": "8b694db5f88c65b06714de5488edefd238185f60",
    "name": "LPCore",
    "manifestFile": "lake-manifest.json",
-   "inputRev": "60fca2313ea3be14f578258dc6390f2fa07b26e7",
+   "inputRev": "8b694db5f88c65b06714de5488edefd238185f60",
    "inherited": false,
    "configFile": "lakefile.lean"}],
  "name": "SoplexFFI",
- "lakeDir": ".lake"}
+ "lakeDir": ".lake",
+ "fixedToolchain": false}
