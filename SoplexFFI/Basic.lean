@@ -55,7 +55,7 @@ initialize
   catch _ =>
     pure ()
 
-namespace Soplex
+namespace LP
 
 /-- SoPlex's compile-time `SOPLEX_VERSION` macro, e.g. `802` for v8.0.2. -/
 @[extern "lean_soplex_version_ffi"]
@@ -439,4 +439,4 @@ def ffiCheckSolve
     (packUInt32Array rows) (packUInt32Array cols)
     (floatArrayOfArray vals)
 
-end Soplex
+end LP

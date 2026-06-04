@@ -8,12 +8,12 @@ open System Lake DSL
 
   The shared LP type vocabulary (`Problem`, `Options`, `Solution`,
   `Certificate`, `SolveError`) and the pure-Lean validators live in
-  `kim-em/lp-core`; `SoplexFFI.Types` and `SoplexFFI.Validate`
+  `leanprover/lp-core`; `SoplexFFI.Types` and `SoplexFFI.Validate`
   re-export from there so existing consumers keep working.
 -/
 
-require LPCore from git "https://github.com/kim-em/lp-core" @
-  "8b694db5f88c65b06714de5488edefd238185f60"
+require LPCore from git "https://github.com/leanprover/lp-core" @
+  "70ca150585f8439a830374b5bec602d391addbc9"
 
 def macSdkPath : String :=
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"

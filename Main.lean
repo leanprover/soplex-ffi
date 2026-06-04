@@ -4,13 +4,13 @@
 
 import SoplexFFI
 
-open Soplex
+open LP
 
 def main : IO UInt32 := do
-  IO.println s!"SoPlex version: {Soplex.version}"
+  IO.println s!"SoPlex version: {LP.version}"
 
   unless System.Platform.isOSX do
-    let exnRc := Soplex.exceptionCheck ()
+    let exnRc := LP.exceptionCheck ()
     IO.println s!"exception check = {exnRc}"
     if exnRc != 0 then
       IO.eprintln s!"std::exception throw/catch broken (rc={exnRc}); cross-stdlib ABI mismatch"

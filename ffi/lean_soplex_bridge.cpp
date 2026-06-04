@@ -490,7 +490,7 @@ static std::vector<Mpq> split_pos(const std::vector<Mpq> &signedVals, bool posit
 // case (positive multipliers wrongly land in `rowLower`, where the
 // `DualBundle` contract requires zero).
 //
-// The verifier (`Soplex/Verify/Bool.lean`) requires:
+// The verifier (`LP/Verify/Bool.lean`) requires:
 //   * `lower[i] = 0` if row `i` has no lower bound, and similarly for
 //     upper;
 //   * all multipliers `≥ 0`.
@@ -990,7 +990,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_ffi_check_solve_ffi(
       &objval);
 
   /*
-   * Layout for `Soplex.FFICheckResult`:
+   * Layout for `LP.FFICheckResult`:
    *   primal : FloatArray   -- object field
    *   ret    : UInt32       -- scalar field
    *   obj    : Float        -- scalar field
@@ -1079,7 +1079,7 @@ static lean_object *mk_opt_rat(const std::string &s, bool present) {
   return present ? mk_some(mk_rat_from_string(s)) : mk_none();
 }
 
-// Construct a `Soplex.Problem` Lean object.
+// Construct a `LP.Problem` Lean object.
 //
 // `Problem m n` is a structure with the following fields in
 // declaration order; Lean lays out a structure as a single anonymous

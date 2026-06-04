@@ -1,7 +1,7 @@
 /-
   Pure-Lean validators for `Problem` and `Options`.
 
-  Source of truth lives in `LPCore.Validate` (`kim-em/lp-core`).
+  Source of truth lives in `LPCore.Validate` (`leanprover/lp-core`).
   This module re-exports `validate`, `validateOptions`, `validateRaw`,
   and `Problem.ofRaw` so any consumer still writing `import
   SoplexFFI.Validate` keeps working.

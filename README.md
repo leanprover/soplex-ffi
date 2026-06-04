@@ -1,7 +1,11 @@
 # SoplexFFI
 
 [![Lean](https://img.shields.io/badge/Lean-4.31.0--rc1-blue.svg)](./lean-toolchain)
-[![License](https://img.shields.io/github/license/kim-em/soplex-ffi.svg)](./LICENSE)
+[![License](https://img.shields.io/github/license/leanprover/soplex-ffi.svg)](./LICENSE)
+
+> **New here? Start at [`leanprover/lp`](https://github.com/leanprover/lp)** — the entry
+> point for the `lp` / `maximize` tactics and the verified LP solver. This repository is one
+> package of that family: the raw SoPlex FFI bindings.
 
 Lean 4 FFI bindings for [SoPlex](https://soplex.zib.de/), the linear
 programming solver from the SCIP optimization suite.
@@ -9,7 +13,7 @@ programming solver from the SCIP optimization suite.
 This repository contains the direct binding only: the vendored SoPlex
 build, the C++ bridge, Lean extern wrappers, marshalling, direct solve
 APIs, and MPS / LP file I/O. The verified Lean layer lives in
-[`kim-em/soplex`](https://github.com/kim-em/soplex).
+[`leanprover/lp`](https://github.com/leanprover/lp).
 
 ## Build
 
@@ -22,7 +26,7 @@ System dependencies:
 | Windows  | MSYS2 `mingw-w64-x86_64-{gcc,cmake,ninja,make,gmp,boost}` |
 
 ```bash
-git clone --recurse-submodules https://github.com/kim-em/soplex-ffi
+git clone --recurse-submodules https://github.com/leanprover/soplex-ffi
 cd soplex-ffi
 lake exe ffi-check
 ```
