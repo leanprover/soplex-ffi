@@ -1,5 +1,8 @@
 # SoplexFFI
 
+[![Lean](https://img.shields.io/badge/Lean-4.31.0--rc1-blue.svg)](./lean-toolchain)
+[![License](https://img.shields.io/github/license/kim-em/soplex-ffi.svg)](./LICENSE)
+
 Lean 4 FFI bindings for [SoPlex](https://soplex.zib.de/), the linear
 programming solver from the SCIP optimization suite.
 
