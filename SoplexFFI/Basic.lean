@@ -16,9 +16,12 @@
   * `solveExact`, `solveFloat`, and MPS / LP file I/O — the direct
     SoPlex-backed solver API.
 -/
+module
 
-import SoplexFFI.Validate
-import Lean
+public import SoplexFFI.Validate
+public import Lean
+
+@[expose] public section
 
 initialize
   try
@@ -94,60 +97,60 @@ structure FFICheckResult where
 deriving Inhabited
 
 @[extern "lean_soplex_ffi_check_solve_ffi"]
-private opaque ffiCheckSolveImpl
+opaque ffiCheckSolveImpl
     (c : @& FloatArray) (b : @& FloatArray)
     (aRows : @& ByteArray) (aCols : @& ByteArray) (aVals : @& FloatArray) :
     FFICheckResult
 
 /-- Pack a `UInt32` little-endian onto a `ByteArray`. -/
-@[inline] private def pushU32LE (bs : ByteArray) (u : UInt32) : ByteArray :=
+@[inline] def pushU32LE (bs : ByteArray) (u : UInt32) : ByteArray :=
   bs.push (u &&& 0xff).toUInt8
     |>.push ((u >>> 8) &&& 0xff).toUInt8
     |>.push ((u >>> 16) &&& 0xff).toUInt8
     |>.push ((u >>> 24) &&& 0xff).toUInt8
 
-private def packUInt32Array (xs : Array UInt32) : ByteArray := Id.run do
+def packUInt32Array (xs : Array UInt32) : ByteArray := Id.run do
   let mut bs := ByteArray.empty
   for x in xs do bs := pushU32LE bs x
   return bs
 
-private def floatArrayOfArray (xs : Array Float) : FloatArray := Id.run do
+def floatArrayOfArray (xs : Array Float) : FloatArray := Id.run do
   let mut a := FloatArray.empty
   for x in xs do a := a.push x
   return a
 
-private def ratStrings (xs : Array Rat) : Array String :=
+def ratStrings (xs : Array Rat) : Array String :=
   xs.map toString
 
 /-- Vector-typed variant of `ratStrings`: keeps the size in the type
     until we cross the FFI boundary (the C++ side wants `Array String`).
     Avoids a `.toArray` projection at the call site. -/
-private def ratStringsV {n : Nat} (xs : Vector Rat n) : Array String :=
+def ratStringsV {n : Nat} (xs : Vector Rat n) : Array String :=
   (xs.map toString).toArray
 
-private def optionRatMask {n : Nat} (xs : Vector (Option Rat) n) : ByteArray := Id.run do
+def optionRatMask {n : Nat} (xs : Vector (Option Rat) n) : ByteArray := Id.run do
   let mut bs := ByteArray.empty
   for x in xs do
     bs := bs.push (if x.isSome then 1 else 0)
   return bs
 
-private def optionRatStrings {n : Nat} (xs : Vector (Option Rat) n) : Array String :=
+def optionRatStrings {n : Nat} (xs : Vector (Option Rat) n) : Array String :=
   (xs.map (fun x => x.elim "0" toString)).toArray
 
-private def checkedU32 (field : String) (n : Nat) :
+def checkedU32 (field : String) (n : Nat) :
     Except ProblemError UInt32 :=
   if n ≤ ffiMaxInt then
     pure (UInt32.ofNat n)
   else
     throw (.tooLarge field ffiMaxInt n)
 
-private def checkedIterLimit (n : Nat) : Except OptionError UInt32 :=
+def checkedIterLimit (n : Nat) : Except OptionError UInt32 :=
   if n ≤ ffiMaxInt then
     pure (UInt32.ofNat n)
   else
     throw (.iterLimitTooLarge ffiMaxInt n)
 
-private def ffiIterLimit (opts : Options) : Except SolveError UInt32 :=
+def ffiIterLimit (opts : Options) : Except SolveError UInt32 :=
   match opts.iterLimit with
   | none => pure 0
   | some n => checkedIterLimit n |>.mapError SolveError.invalidOptions
@@ -155,7 +158,7 @@ private def ffiIterLimit (opts : Options) : Except SolveError UInt32 :=
 /-- Flat marshalling of a `Problem`'s sparse / bound data into the
     ByteArray + decimal-string form the C++ bridge expects. Shared
     between `solveExact`, `writeMps`, and `writeLp`. -/
-private structure ProblemFlat where
+structure ProblemFlat where
   numVars        : UInt32
   numConstraints : UInt32
   c              : Array String
@@ -172,7 +175,7 @@ private structure ProblemFlat where
   colHiMask      : ByteArray
   colHi          : Array String
 
-private def problemFlatten {m n : Nat} (p : Problem m n) :
+def problemFlatten {m n : Nat} (p : Problem m n) :
     Except ProblemError ProblemFlat := do
   let numVars ← checkedU32 "numVars" n
   let numConstraints ← checkedU32 "numConstraints" m
@@ -210,7 +213,7 @@ private def problemFlatten {m n : Nat} (p : Problem m n) :
     coercion proof that adds more friction than the saved arg-slots
     are worth. -/
 @[extern "lean_soplex_solve_exact"]
-private opaque solveExactFlat {m n : Nat}
+opaque solveExactFlat {m n : Nat}
     (numVars numConstraints : UInt32)
     (sense simplex : UInt8)
     (hasTimeLimit : Bool) (timeLimit : Float)
@@ -225,20 +228,20 @@ private opaque solveExactFlat {m n : Nat}
     (colHiMask : @& ByteArray) (colHi : @& Array String) :
     Except String (Solution m n)
 
-private def solveErrorFromBridge (e : String) : SolveError :=
+def solveErrorFromBridge (e : String) : SolveError :=
   .bridge e
 
-private def mapObjectiveForSense {m n : Nat} (sense : ObjSense)
+def mapObjectiveForSense {m n : Nat} (sense : ObjSense)
     (s : Solution m n) : Solution m n :=
   match sense with
   | .minimize => s
   | .maximize => { s with objective := s.objective.map Neg.neg }
 
-private def objSenseTag : ObjSense → UInt8
+def objSenseTag : ObjSense → UInt8
   | .minimize => 0
   | .maximize => 1
 
-private def simplexTag : Simplex → UInt8
+def simplexTag : Simplex → UInt8
   | .primal => 0
   | .dual => 1
   | .auto => 2
@@ -271,7 +274,7 @@ opaque solveExact {m n : Nat} (opts : Options) (p : Problem m n) :
   pure (mapObjectiveForSense opts.sense sol)
 
 @[extern "lean_soplex_solve_float"]
-private opaque solveFloatFlat {n : Nat}
+opaque solveFloatFlat {n : Nat}
     (numVars numConstraints : UInt32)
     (sense simplex : UInt8)
     (hasTimeLimit : Bool) (timeLimit : Float)
@@ -286,7 +289,7 @@ private opaque solveFloatFlat {n : Nat}
     (colHiMask : @& ByteArray) (colHi : @& Array String) :
     Except String (FloatSolution n)
 
-private def mapFloatObjectiveForSense {n : Nat} (sense : ObjSense)
+def mapFloatObjectiveForSense {n : Nat} (sense : ObjSense)
     (s : FloatSolution n) : FloatSolution n :=
   match sense with
   | .minimize => s
@@ -343,15 +346,15 @@ opaque solveFloat {m n : Nat} (opts : Options) (p : Problem m n) :
   rows — are SoPlex format properties, not bridge artefacts. -/
 
 @[extern "lean_soplex_read_mps_ffi"]
-private opaque readMpsImpl (path : @& String) :
+opaque readMpsImpl (path : @& String) :
     Except String (Σ m n, Problem m n)
 
 @[extern "lean_soplex_read_lp_ffi"]
-private opaque readLpImpl (path : @& String) :
+opaque readLpImpl (path : @& String) :
     Except String (Σ m n, Problem m n)
 
 @[extern "lean_soplex_write_mps_ffi"]
-private opaque writeMpsFlat
+opaque writeMpsFlat
     (path : @& String)
     (numVars numConstraints : UInt32)
     (c : @& Array String) (objOffset : @& String)
@@ -363,7 +366,7 @@ private opaque writeMpsFlat
     Except String Unit
 
 @[extern "lean_soplex_write_lp_ffi"]
-private opaque writeLpFlat
+opaque writeLpFlat
     (path : @& String)
     (numVars numConstraints : UInt32)
     (c : @& Array String) (objOffset : @& String)

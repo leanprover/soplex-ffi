@@ -1,7 +1,10 @@
 /-
   Top-level entry point for the direct SoPlex FFI package.
 -/
+module
 
-import SoplexFFI.Types
-import SoplexFFI.Validate
-import SoplexFFI.Basic
+public import SoplexFFI.Types
+public import SoplexFFI.Validate
+public import SoplexFFI.Basic
+
+@[expose] public section
