@@ -38,6 +38,20 @@ def sanitizerArgs : Array String :=
   else
     #[]
 
+/-- The Lean toolchain's own `lib` directory, passed by CI as `-KleanLibDir=...`
+    (`$(lean --print-prefix)/lib`). On Linux the `-L/usr/lib*` dirs below are needed
+    to find GMP, but those dirs also hold Ubuntu's `libc++.so`, and a command-line
+    `-L` is searched before the toolchain's own lib dir, so they shadow the Lean
+    toolchain's libc++ for `-lc++`. Ubuntu's libc++ 18 does not export the C++20
+    symbols (`std::__1::__hash_memory`, `__atomic_wait_native`) that the
+    toolchain-built `libleanrt.a`/`libleancpp.a` reference (the toolchain's own
+    libc++ does), so the shadow breaks the link on v4.31. Putting the toolchain lib
+    dir first restores the toolchain libc++ while leaving GMP resolvable. -/
+def leanLibDirArgs : Array String :=
+  match get_config? leanLibDir with
+  | some d => #[s!"-L{d}"]
+  | none => #[]
+
 def soplexRuntimeLinkArgs : Array String :=
   if System.Platform.isOSX then
     #[s!"-Wl,-syslibroot,{macSdkPath}",
@@ -56,6 +70,9 @@ def soplexRuntimeLinkArgs : Array String :=
       "-lmingwex",
       "-lmsvcrt"]
   else
+    -- Toolchain lib dir FIRST (see `leanLibDirArgs`) so `-lc++` binds to the
+    -- toolchain libc++; the `-L/usr/lib*` dirs that follow stay for GMP.
+    leanLibDirArgs ++
     #["-L/usr/lib/x86_64-linux-gnu",
       "-L/usr/lib/aarch64-linux-gnu",
       "-L/usr/lib64",

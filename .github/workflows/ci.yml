@@ -41,7 +41,7 @@ jobs:
           ./scripts/install-toolchain.sh
 
       - name: Build and run ffi-check
-        run: lake exe ffi-check
+        run: lake exe "-KleanLibDir=$(lean --print-prefix)/lib" ffi-check
 
   linux-asan:
     name: Linux ASan/UBSan
@@ -97,7 +97,7 @@ jobs:
 
       - name: Build and run ffi-check under ASan/UBSan
         run: |
-          LD_PRELOAD="$ASAN_RUNTIME" lake build -Ksanitize=1 ffi-check
+          LD_PRELOAD="$ASAN_RUNTIME" lake build -Ksanitize=1 "-KleanLibDir=$(lean --print-prefix)/lib" ffi-check
           ldd ./.lake/build/bin/ffi-check || true
           ./.lake/build/bin/ffi-check
 
