@@ -12,8 +12,7 @@ open System Lake DSL
   re-export from there so existing consumers keep working.
 -/
 
-require LPCore from git "https://github.com/leanprover/lp-core" @
-  "70ca150585f8439a830374b5bec602d391addbc9"
+require LPCore from git "https://github.com/leanprover/lp-core" @ "54ab1470e0a7c9b6fa3cfd676500db361560db43"
 
 def macSdkPath : String :=
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"

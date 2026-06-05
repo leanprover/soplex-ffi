@@ -9,5 +9,8 @@
 
   Pure-Lean only — no dependency on the native FFI.
 -/
+module
 
-import LPCore.Types
+public import LPCore.Types
+
+@[expose] public section

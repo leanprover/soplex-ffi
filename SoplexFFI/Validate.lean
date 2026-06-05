@@ -8,5 +8,8 @@
 
   Pure-Lean only — no dependency on the native FFI.
 -/
+module
 
-import LPCore.Validate
+public import LPCore.Validate
+
+@[expose] public section
