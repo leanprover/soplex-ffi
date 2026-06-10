@@ -167,10 +167,19 @@ def pushNatLE (bs : ByteArray) (n : Nat) (len : Nat) : ByteArray := Id.run do
   return bs
 
 /-- Append a `u32` length prefix followed by `n`'s little-endian
-    digits. -/
+    digits.
+
+    A value whose magnitude exceeds `2^(8·(2^32 − 1))` (a 4 GiB
+    numerator) cannot be length-prefixed; that is unreachable for any
+    problem that fits in memory, but panic rather than wrap the prefix.
+    The bridge's structural validation rejects the truncated buffer a
+    panic would leave behind. -/
 def pushNatField (bs : ByteArray) (n : Nat) : ByteArray :=
   let len := natLEByteLen n
-  pushNatLE (pushU32LE bs (UInt32.ofNat len)) n len
+  if len > 0xffffffff then
+    panic! "rational magnitude too large for the FFI wire format"
+  else
+    pushNatLE (pushU32LE bs (UInt32.ofNat len)) n len
 
 /-- Append one packed-rational record (see the wire-format note
     above). -/

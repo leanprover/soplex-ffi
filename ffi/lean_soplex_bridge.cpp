@@ -157,6 +157,27 @@ static void init_mpq_vector(std::vector<Mpq> &xs, size_t n) {
   for (size_t i = 0; i < n; ++i) xs.emplace_back();
 }
 
+/* RAII raw `mpq_t` array for SoPlex's rational getters; the destructor
+ * clears every entry, covering the failure / throw paths too. */
+class MpqArray {
+ public:
+  explicit MpqArray(size_t n) : p_(new mpq_t[n]), n_(n) {
+    for (size_t i = 0; i < n_; ++i) mpq_init(p_[i]);
+  }
+  ~MpqArray() {
+    for (size_t i = 0; i < n_; ++i) mpq_clear(p_[i]);
+  }
+  MpqArray(const MpqArray &) = delete;
+  MpqArray &operator=(const MpqArray &) = delete;
+
+  mpq_t *data() { return p_.get(); }
+  const mpq_t &operator[](size_t i) const { return p_[i]; }
+
+ private:
+  std::unique_ptr<mpq_t[]> p_;
+  size_t n_;
+};
+
 // The limb-walking conversions below assume GMP's limbs are 64-bit
 // with no nail bits, true on every platform this package targets
 // (Linux x86_64/aarch64, macOS arm64, Windows x86_64 via MinGW).
@@ -376,10 +397,11 @@ static DecodedProblem decode_problem(
   DecodedProblem dp;
   dp.numVars = static_cast<int>(numVars_u);
   dp.numConstraints = static_cast<int>(numConstraints_u);
-  dp.nnz = lean_sarray_size(a_rows_arr) / sizeof(int32_t);
-  if (lean_sarray_size(a_cols_arr) != lean_sarray_size(a_rows_arr)) {
-    throw std::runtime_error("sparse row / column index buffers differ in length");
+  if (lean_sarray_size(a_rows_arr) % sizeof(int32_t) != 0 ||
+      lean_sarray_size(a_cols_arr) != lean_sarray_size(a_rows_arr)) {
+    throw std::runtime_error("malformed sparse index buffers");
   }
+  dp.nnz = lean_sarray_size(a_rows_arr) / sizeof(int32_t);
   dp.aRows = byte_array_as_i32(a_rows_arr);
   dp.aCols = byte_array_as_i32(a_cols_arr);
   size_t m = static_cast<size_t>(dp.numConstraints);
@@ -778,16 +800,14 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
     lean_object *ray = mk_none();
 
     auto fetch = [&](size_t n, auto getter, const char *what) {
+      MpqArray raw(n);
+      bool ok = (solver.*getter)(raw.data(), static_cast<int>(n));
+      if (!ok) throw std::runtime_error(std::string("SoPlex failed to return ") + what);
       std::vector<Mpq> xs;
       init_mpq_vector(xs, n);
-      std::unique_ptr<mpq_t[]> raw(new mpq_t[n]);
-      for (size_t i = 0; i < n; ++i) mpq_init(raw[i]);
-      bool ok = (solver.*getter)(raw.get(), static_cast<int>(n));
-      if (!ok) throw std::runtime_error(std::string("SoPlex failed to return ") + what);
       for (size_t i = 0; i < n; ++i) {
         mpq_set(xs[i].q, raw[i]);
         mpq_canonicalize(xs[i].q);
-        mpq_clear(raw[i]);
       }
       return xs;
     };
@@ -796,18 +816,21 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
       case SPxSolver::OPTIMAL:
       case SPxSolver::OPTIMAL_UNSCALED_VIOLATIONS: {
         status = 0;
+        // Throwing work (SoPlex getters, GMP) first; Lean allocation
+        // only once everything is in hand, so a failed fetch cannot
+        // leak partially built Lean objects.
         Rational objVal = solver.objValueRational();
-        objective = mk_some(mk_rat_from_mpq_canon(objVal.backend().data()));
         std::vector<Mpq> x = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getPrimalRational),
           "primal solution");
-        primal = mk_some(mk_array_from_mpqs(x));
         std::vector<Mpq> y = fetch(input.numConstraints,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getDualRational),
           "dual solution");
         std::vector<Mpq> z = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getRedCostRational),
           "reduced costs");
+        objective = mk_some(mk_rat_from_mpq_canon(objVal.backend().data()));
+        primal = mk_some(mk_array_from_mpqs(x));
         lean_object *rowLower, *rowUpper, *colLower, *colUpper;
         mk_split_pos_arrays(y, &rowLower, &rowUpper);
         mk_split_pos_arrays(z, &colLower, &colUpper);
@@ -861,8 +884,9 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
         break;
     }
 
+    const std::string log = logCap.str();
     lean_object *cert = mk_certificate(primal, dual, ray);
-    lean_object *sol = mk_solution(status, objective, cert, logCap.str());
+    lean_object *sol = mk_solution(status, objective, cert, log);
     return mk_except_ok(sol);
   } catch (const std::exception &e) {
     return mk_except_error(e.what());
@@ -997,7 +1021,8 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_float(
         break;
     }
 
-    return mk_except_ok(mk_float_solution(status, primal, objective, logCap.str()));
+    const std::string log = logCap.str();
+    return mk_except_ok(mk_float_solution(status, primal, objective, log));
   } catch (const std::exception &e) {
     return mk_except_error(e.what());
   } catch (...) {
