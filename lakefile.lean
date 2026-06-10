@@ -325,3 +325,7 @@ lean_lib SoplexFFI where
 @[test_driver]
 lean_exe «ffi-check» where
   root := `Main
+
+/-- Marshalling benchmark (`lake exe bench [n]`); see `Bench.lean`. -/
+lean_exe bench where
+  root := `Bench

@@ -123,29 +123,78 @@ def floatArrayOfArray (xs : Array Float) : FloatArray := Id.run do
   for x in xs do a := a.push x
   return a
 
-/-- Marshalling helper: render rationals as the canonical decimal
-    strings (`"n"` or `"n/d"`) the bridge parses with GMP. -/
-def ratStrings (xs : Array Rat) : Array String :=
-  xs.map toString
+/-! ## Packed-rational wire format.
 
-/-- Vector-typed variant of `ratStrings`: keeps the size in the type
-    until we cross the FFI boundary (the C++ side wants `Array String`).
-    Avoids a `.toArray` projection at the call site. -/
-def ratStringsV {n : Nat} (xs : Vector Rat n) : Array String :=
-  (xs.map toString).toArray
+  Rationals cross the FFI as a flat `ByteArray`, one record per value:
 
-/-- Marshalling helper: presence mask for optional bounds (1 = bound
-    present, 0 = infinite), paired with `optionRatStrings`. -/
-def optionRatMask {n : Nat} (xs : Vector (Option Rat) n) : ByteArray := Id.run do
-  let mut bs := ByteArray.empty
-  for x in xs do
-    bs := bs.push (if x.isSome then 1 else 0)
+  ```
+  u8  sign      1 = negative numerator, 0 otherwise
+  u32 numLen    little-endian byte count of |num|
+  ..  num       |num| as `numLen` base-256 digits, least significant
+                first, no trailing zero byte; `numLen = 0` ⇔ `num = 0`
+  u32 denLen    same encoding for the denominator;
+                `denLen = 0` ⇔ `den = 1` (the common integer case)
+  ..  den
+  ```
+
+  The C++ bridge reads each record with `mpz_import`. Like the
+  decimal-string encoding it replaces, this format is independent of
+  Lean's small-vs-boxed integer representation, but it avoids decimal
+  formatting here and GMP decimal parsing on the C++ side. Records are
+  canonical by construction (`Rat` carries reducedness proofs), so the
+  bridge performs no gcd on input. -/
+
+/-- Byte count of `n`'s minimal little-endian base-256 encoding
+    (`0` for `n = 0`). -/
+@[inline] def natLEByteLen (n : Nat) : Nat :=
+  if n == 0 then 0 else n.log2 / 8 + 1
+
+/-- Append exactly `len` little-endian base-256 digits of `n`,
+    extracting 64-bit chunks so the per-byte cost stays low for
+    multi-limb numerators. -/
+def pushNatLE (bs : ByteArray) (n : Nat) (len : Nat) : ByteArray := Id.run do
+  let mut bs := bs
+  let mut n := n
+  let mut remaining := len
+  while remaining > 0 do
+    let mut chunk := n.toUInt64
+    let take := min remaining 8
+    for _ in [0:take] do
+      bs := bs.push chunk.toUInt8
+      chunk := chunk >>> 8
+    n := n >>> 64
+    remaining := remaining - take
   return bs
 
-/-- Marshalling helper: decimal-string rendering of optional bounds;
-    absent bounds render as `"0"` and are ignored via `optionRatMask`. -/
-def optionRatStrings {n : Nat} (xs : Vector (Option Rat) n) : Array String :=
-  (xs.map (fun x => x.elim "0" toString)).toArray
+/-- Append a `u32` length prefix followed by `n`'s little-endian
+    digits.
+
+    A value whose magnitude exceeds `2^(8·(2^32 − 1))` (a 4 GiB
+    numerator) cannot be length-prefixed; that is unreachable for any
+    problem that fits in memory, but panic rather than wrap the prefix.
+    The bridge's structural validation rejects the truncated buffer a
+    panic would leave behind. -/
+def pushNatField (bs : ByteArray) (n : Nat) : ByteArray :=
+  let len := natLEByteLen n
+  if len > 0xffffffff then
+    panic! "rational magnitude too large for the FFI wire format"
+  else
+    pushNatLE (pushU32LE bs (UInt32.ofNat len)) n len
+
+/-- Append one packed-rational record (see the wire-format note
+    above). -/
+def pushRatLE (bs : ByteArray) (q : Rat) : ByteArray :=
+  let bs := bs.push (if q.num < 0 then (1 : UInt8) else 0)
+  let bs := pushNatField bs q.num.natAbs
+  if q.den == 1 then pushU32LE bs 0 else pushNatField bs q.den
+
+/-- Rough capacity hint per packed rational: sign + two `u32` lengths
+    + one 64-bit limb. Buffers grow past this as needed. -/
+def ratRecordSizeHint : Nat := 17
+
+/-- Pack a single rational (used for `objOffset`). -/
+def packRat (q : Rat) : ByteArray :=
+  pushRatLE (ByteArray.emptyWithCapacity ratRecordSizeHint) q
 
 /-- Boundary check: a `Nat` must fit the bridge's 32-bit slots. -/
 def checkedU32 (field : String) (n : Nat) :
@@ -171,52 +220,69 @@ def ffiIterLimit (opts : Options) : Except SolveError UInt32 :=
   | some n => checkedIterLimit n |>.mapError SolveError.invalidOptions
 
 /-- Flat marshalling of a `Problem`'s sparse / bound data into the
-    ByteArray + decimal-string form the C++ bridge expects. Shared
-    between `solveExact`, `writeMps`, and `writeLp`. -/
+    ByteArray form the C++ bridge expects (packed rationals for all
+    values, presence masks for optional bounds). Shared between
+    `solveExact`, `writeMps`, and `writeLp`. -/
 structure ProblemFlat where
   numVars        : UInt32
   numConstraints : UInt32
-  c              : Array String
-  objOffset      : String
+  c              : ByteArray
+  objOffset      : ByteArray
   aRows          : ByteArray
   aCols          : ByteArray
-  aVals          : Array String
+  aVals          : ByteArray
   rowLoMask      : ByteArray
-  rowLo          : Array String
+  rowLo          : ByteArray
   rowHiMask      : ByteArray
-  rowHi          : Array String
+  rowHi          : ByteArray
   colLoMask      : ByteArray
-  colLo          : Array String
+  colLo          : ByteArray
   colHiMask      : ByteArray
-  colHi          : Array String
+  colHi          : ByteArray
 
 def problemFlatten {m n : Nat} (p : Problem m n) :
     Except ProblemError ProblemFlat := do
   let numVars ← checkedU32 "numVars" n
   let numConstraints ← checkedU32 "numConstraints" m
-  let rows ← p.a.mapM (fun e => checkedU32 "sparse row index" e.1.val)
-  let cols ← p.a.mapM (fun e => checkedU32 "sparse column index" e.2.1.val)
-  let vals  := p.a.map (fun e => e.2.2)
-  let rowLo := p.rowBounds.map Prod.fst
-  let rowHi := p.rowBounds.map Prod.snd
-  let colLo := p.colBounds.map Prod.fst
-  let colHi := p.colBounds.map Prod.snd
+  -- Sparse entries carry `Fin m` / `Fin n` indices, so once `m` and `n`
+  -- pass `checkedU32` every index fits a `UInt32` with no further
+  -- per-entry checks.
+  let nnz := p.a.size
+  let mut aRows := ByteArray.emptyWithCapacity (4 * nnz)
+  let mut aCols := ByteArray.emptyWithCapacity (4 * nnz)
+  let mut aVals := ByteArray.emptyWithCapacity (ratRecordSizeHint * nnz)
+  for (i, j, v) in p.a do
+    aRows := pushU32LE aRows (UInt32.ofNat i.val)
+    aCols := pushU32LE aCols (UInt32.ofNat j.val)
+    aVals := pushRatLE aVals v
+  let mut c := ByteArray.emptyWithCapacity (ratRecordSizeHint * n)
+  for x in p.c do
+    c := pushRatLE c x
+  -- Bound buffers always contain one record per index; absent bounds
+  -- encode as `0` and are skipped via the mask.
+  let mut rowLoMask := ByteArray.emptyWithCapacity m
+  let mut rowHiMask := ByteArray.emptyWithCapacity m
+  let mut rowLo := ByteArray.emptyWithCapacity (ratRecordSizeHint * m)
+  let mut rowHi := ByteArray.emptyWithCapacity (ratRecordSizeHint * m)
+  for (lo, hi) in p.rowBounds do
+    rowLoMask := rowLoMask.push (if lo.isSome then 1 else 0)
+    rowLo := pushRatLE rowLo (lo.getD 0)
+    rowHiMask := rowHiMask.push (if hi.isSome then 1 else 0)
+    rowHi := pushRatLE rowHi (hi.getD 0)
+  let mut colLoMask := ByteArray.emptyWithCapacity n
+  let mut colHiMask := ByteArray.emptyWithCapacity n
+  let mut colLo := ByteArray.emptyWithCapacity (ratRecordSizeHint * n)
+  let mut colHi := ByteArray.emptyWithCapacity (ratRecordSizeHint * n)
+  for (lo, hi) in p.colBounds do
+    colLoMask := colLoMask.push (if lo.isSome then 1 else 0)
+    colLo := pushRatLE colLo (lo.getD 0)
+    colHiMask := colHiMask.push (if hi.isSome then 1 else 0)
+    colHi := pushRatLE colHi (hi.getD 0)
   pure {
-    numVars        := numVars
-    numConstraints := numConstraints
-    c              := ratStringsV p.c
-    objOffset      := toString p.objOffset
-    aRows          := packUInt32Array rows
-    aCols          := packUInt32Array cols
-    aVals          := ratStrings vals
-    rowLoMask      := optionRatMask rowLo
-    rowLo          := optionRatStrings rowLo
-    rowHiMask      := optionRatMask rowHi
-    rowHi          := optionRatStrings rowHi
-    colLoMask      := optionRatMask colLo
-    colLo          := optionRatStrings colLo
-    colHiMask      := optionRatMask colHi
-    colHi          := optionRatStrings colHi }
+    numVars, numConstraints, c, aRows, aCols, aVals
+    objOffset := packRat p.objOffset
+    rowLoMask, rowLo, rowHiMask, rowHi
+    colLoMask, colLo, colHiMask, colHi }
 
 /-- C++ bridge for exact solve. `{m n : Nat}` are implicit so the
     Lean caller passes them positionally to the FFI as `lean_object*`;
@@ -235,12 +301,12 @@ opaque solveExactFlat {m n : Nat}
     (hasIterLimit : Bool) (iterLimit : UInt32)
     (verbose : Bool) (randomSeed : UInt32)
     (precisionBoost presolve : Bool)
-    (c : @& Array String) (objOffset : @& String)
-    (aRows aCols : @& ByteArray) (aVals : @& Array String)
-    (rowLoMask : @& ByteArray) (rowLo : @& Array String)
-    (rowHiMask : @& ByteArray) (rowHi : @& Array String)
-    (colLoMask : @& ByteArray) (colLo : @& Array String)
-    (colHiMask : @& ByteArray) (colHi : @& Array String) :
+    (c : @& ByteArray) (objOffset : @& ByteArray)
+    (aRows aCols aVals : @& ByteArray)
+    (rowLoMask rowLo : @& ByteArray)
+    (rowHiMask rowHi : @& ByteArray)
+    (colLoMask colLo : @& ByteArray)
+    (colHiMask colHi : @& ByteArray) :
     Except String (Solution m n)
 
 def solveErrorFromBridge (e : String) : SolveError :=
@@ -258,11 +324,11 @@ def simplexTag : Simplex → UInt8
   | .auto => 2
 
 /-- Exact rational solve through SoPlex. The bridge receives rationals
-    as canonical decimal strings (`"n"` or `"n/d"`), deliberately avoiding
-    any dependence on Lean's small-vs-boxed integer representation across
-    the C++ ABI. For `.maximize`, the LP sent to SoPlex is the verifier's
-    minimization canonicalization; the reported objective is flipped back
-    into the caller's original sense. -/
+    in the packed numerator/denominator wire format described above,
+    deliberately avoiding any dependence on Lean's small-vs-boxed integer
+    representation across the C++ ABI. For `.maximize`, the LP sent to
+    SoPlex is the verifier's minimization canonicalization; the reported
+    objective is flipped back into the caller's original sense. -/
 opaque solveExact {m n : Nat} (opts : Options) (p : Problem m n) :
     Except SolveError (Solution m n) := do
   let opts ← validateOptions opts |>.mapError SolveError.invalidOptions
@@ -294,12 +360,12 @@ opaque solveFloatFlat {n : Nat}
     (hasIterLimit : Bool) (iterLimit : UInt32)
     (verbose : Bool) (randomSeed : UInt32)
     (presolve : Bool)
-    (c : @& Array String) (objOffset : @& String)
-    (aRows aCols : @& ByteArray) (aVals : @& Array String)
-    (rowLoMask : @& ByteArray) (rowLo : @& Array String)
-    (rowHiMask : @& ByteArray) (rowHi : @& Array String)
-    (colLoMask : @& ByteArray) (colLo : @& Array String)
-    (colHiMask : @& ByteArray) (colHi : @& Array String) :
+    (c : @& ByteArray) (objOffset : @& ByteArray)
+    (aRows aCols aVals : @& ByteArray)
+    (rowLoMask rowLo : @& ByteArray)
+    (rowHiMask rowHi : @& ByteArray)
+    (colLoMask colLo : @& ByteArray)
+    (colHiMask colHi : @& ByteArray) :
     Except String (FloatSolution n)
 
 def mapFloatObjectiveForSense {n : Nat} (sense : ObjSense)
@@ -309,7 +375,7 @@ def mapFloatObjectiveForSense {n : Nat} (sense : ObjSense)
   | .maximize => { s with objective := s.objective.map Neg.neg }
 
 /-- Floating-point solve through SoPlex. Mirrors `solveExact`'s ABI
-    (decimal-string `Rat` marshalling) but builds the LP via
+    (packed-rational `Rat` marshalling) but builds the LP via
     `addColReal` / `addRowReal` and runs SoPlex in its default mode.
 
     The returned `primalAsRat` entries are exact rationals representing
@@ -371,24 +437,24 @@ opaque readLpImpl (path : @& String) :
 opaque writeMpsFlat
     (path : @& String)
     (numVars numConstraints : UInt32)
-    (c : @& Array String) (objOffset : @& String)
-    (aRows aCols : @& ByteArray) (aVals : @& Array String)
-    (rowLoMask : @& ByteArray) (rowLo : @& Array String)
-    (rowHiMask : @& ByteArray) (rowHi : @& Array String)
-    (colLoMask : @& ByteArray) (colLo : @& Array String)
-    (colHiMask : @& ByteArray) (colHi : @& Array String) :
+    (c : @& ByteArray) (objOffset : @& ByteArray)
+    (aRows aCols aVals : @& ByteArray)
+    (rowLoMask rowLo : @& ByteArray)
+    (rowHiMask rowHi : @& ByteArray)
+    (colLoMask colLo : @& ByteArray)
+    (colHiMask colHi : @& ByteArray) :
     Except String Unit
 
 @[extern "lean_soplex_write_lp_ffi"]
 opaque writeLpFlat
     (path : @& String)
     (numVars numConstraints : UInt32)
-    (c : @& Array String) (objOffset : @& String)
-    (aRows aCols : @& ByteArray) (aVals : @& Array String)
-    (rowLoMask : @& ByteArray) (rowLo : @& Array String)
-    (rowHiMask : @& ByteArray) (rowHi : @& Array String)
-    (colLoMask : @& ByteArray) (colLo : @& Array String)
-    (colHiMask : @& ByteArray) (colHi : @& Array String) :
+    (c : @& ByteArray) (objOffset : @& ByteArray)
+    (aRows aCols aVals : @& ByteArray)
+    (rowLoMask rowLo : @& ByteArray)
+    (rowHiMask rowHi : @& ByteArray)
+    (colLoMask colLo : @& ByteArray)
+    (colHiMask colHi : @& ByteArray) :
     Except String Unit
 
 /-- Parse a `Problem` from an MPS file via SoPlex's rational reader.
