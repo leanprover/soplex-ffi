@@ -328,7 +328,12 @@ def simplexTag : Simplex → UInt8
     deliberately avoiding any dependence on Lean's small-vs-boxed integer
     representation across the C++ ABI. For `.maximize`, the LP sent to
     SoPlex is the verifier's minimization canonicalization; the reported
-    objective is flipped back into the caller's original sense. -/
+    objective is flipped back into the caller's original sense.
+
+    The bridge adds the marshalled (canonical-sense) `objOffset` to
+    SoPlex's `c·x` before returning, so after the sense flip the
+    reported objective is in the caller's original sense *including*
+    `objOffset`, per `Solution.objective`'s contract in lp-core. -/
 opaque solveExact {m n : Nat} (opts : Options) (p : Problem m n) :
     Except SolveError (Solution m n) := do
   let opts ← validateOptions opts |>.mapError SolveError.invalidOptions
@@ -377,6 +382,8 @@ def mapFloatObjectiveForSense {n : Nat} (sense : ObjSense)
 /-- Floating-point solve through SoPlex. Mirrors `solveExact`'s ABI
     (packed-rational `Rat` marshalling) but builds the LP via
     `addColReal` / `addRowReal` and runs SoPlex in its default mode.
+    As in `solveExact`, the reported objective includes `objOffset`
+    (converted to `Float`) and is in the caller's original sense.
 
     The returned `primalAsRat` entries are exact rationals representing
     the IEEE-754 doubles SoPlex computed (via `mpq_set_d`), **not**

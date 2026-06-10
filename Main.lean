@@ -72,13 +72,53 @@ def main : IO UInt32 := do
       IO.eprintln s!"multi-limb exact solve failed: {repr e}"
       return 7
   | .ok sol =>
-      -- The bridge reports SoPlex's objective `c·x`; it does not add
-      -- `objOffset`.
-      let expected := big * bigNeg
+      -- The reported objective is `c·x + objOffset`, with the offset
+      -- added exactly; here both factors and the offset are multi-limb.
+      let expected := big * bigNeg + bigNeg
       if sol.status != .optimal || sol.objective != some expected ||
           (sol.certificate.primal.map (·.toArray)) != some #[bigNeg] then
         IO.eprintln s!"expected exact multi-limb optimum, got {repr sol}"
         return 8
+
+  -- Nonzero `objOffset` under `.maximize`: canonicalization negates
+  -- both `c` and the offset, so this pins the sign bookkeeping across
+  -- the bridge and the sense flip. Maximize `x + 7` over `x ≤ 5`.
+  let offMax : Problem 1 1 :=
+    { c := #v[1]
+      objOffset := 7
+      a := #[(⟨0, by decide⟩, ⟨0, by decide⟩, 1)]
+      rowBounds := #v[(none, some 5)]
+      colBounds := #v[(none, none)] }
+  match solveExact { ({} : Options) with sense := .maximize, presolve := false } offMax with
+  | .error e =>
+      IO.eprintln s!"maximize-with-offset solve failed: {repr e}"
+      return 16
+  | .ok sol =>
+      if sol.status != .optimal || sol.objective != some 12 ||
+          (sol.certificate.primal.map (·.toArray)) != some #[5] then
+        IO.eprintln s!"expected objective 12 (= 5 + 7) under maximize, got {repr sol}"
+        return 17
+
+  -- Float path with nonzero `objOffset`: minimize `x + 5/2` over `x ≥ 3`.
+  let offFloat : Problem 1 1 :=
+    { c := #v[1]
+      objOffset := 5/2
+      a := #[(⟨0, by decide⟩, ⟨0, by decide⟩, 1)]
+      rowBounds := #v[(some 3, none)]
+      colBounds := #v[(none, none)] }
+  match solveFloat { ({} : Options) with presolve := false } offFloat with
+  | .error e =>
+      IO.eprintln s!"float solve with offset failed: {repr e}"
+      return 18
+  | .ok sol =>
+      match sol.status, sol.objective with
+      | .optimal, some obj =>
+          if (obj - 5.5).abs > 1e-9 then
+            IO.eprintln s!"expected float objective close to 5.5, got {obj}"
+            return 19
+      | _, _ =>
+          IO.eprintln s!"expected optimal float solve with objective, got {repr sol}"
+          return 20
 
   -- Infeasible: `x ≥ 1` and `x ≤ 0` as two rows; the Farkas dual must
   -- come back through the mask-aware certificate extraction.

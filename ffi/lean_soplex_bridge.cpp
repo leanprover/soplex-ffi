@@ -819,7 +819,17 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
         // Throwing work (SoPlex getters, GMP) first; Lean allocation
         // only once everything is in hand, so a failed fetch cannot
         // leak partially built Lean objects.
-        Rational objVal = solver.objValueRational();
+        // SoPlex's objective is `c·x`; the reported objective must
+        // include the constant `objOffset` (`Solution.objective`'s
+        // contract in lp-core), so add it here in exact arithmetic.
+        // GMP's mpq functions require canonical operands, and SoPlex's
+        // value is not guaranteed canonical, so canonicalize first.
+        Rational soplexObj = solver.objValueRational();
+        Mpq objVal;
+        mpq_set(objVal.q, soplexObj.backend().data());
+        mpq_canonicalize(objVal.q);
+        Mpq off = decode_rat(objOffset);
+        mpq_add(objVal.q, objVal.q, off.q);
         std::vector<Mpq> x = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getPrimalRational),
           "primal solution");
@@ -829,7 +839,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
         std::vector<Mpq> z = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getRedCostRational),
           "reduced costs");
-        objective = mk_some(mk_rat_from_mpq_canon(objVal.backend().data()));
+        objective = mk_some(mk_rat_from_mpq(objVal.q));
         primal = mk_some(mk_array_from_mpqs(x));
         lean_object *rowLower, *rowUpper, *colLower, *colUpper;
         mk_split_pos_arrays(y, &rowLower, &rowUpper);
@@ -950,7 +960,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_float(
     uint8_t hasIterLimit, uint32_t iterLimit,
     uint8_t verbose, uint32_t randomSeed,
     uint8_t presolve,
-    b_lean_obj_arg c_arr, b_lean_obj_arg /*objOffset*/,
+    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset,
     b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_arr,
     b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
     b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
@@ -995,7 +1005,10 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_float(
           lean_array_cptr(arr)[j] = mk_rat_from_double(x[j]);
         }
         primal = mk_some(arr);
-        objective = mk_some_float(solver.objValueReal());
+        // As in the exact path, the reported objective includes
+        // `objOffset`; the offset is converted to double via GMP.
+        Mpq off = decode_rat(objOffset);
+        objective = mk_some_float(solver.objValueReal() + mpq_get_d(off.q));
         break;
       }
       case SPxSolver::INFEASIBLE:
