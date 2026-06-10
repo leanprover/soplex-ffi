@@ -8,11 +8,11 @@ open System Lake DSL
 
   The shared LP type vocabulary (`Problem`, `Options`, `Solution`,
   `Certificate`, `SolveError`) and the pure-Lean validators live in
-  `leanprover/lp-core`; `SoplexFFI.Types` and `SoplexFFI.Validate`
-  re-export from there so existing consumers keep working.
+  `leanprover/lp-core` and are re-exported by the top-level
+  `SoplexFFI` module.
 -/
 
-require LPCore from git "https://github.com/leanprover/lp-core" @ "54ab1470e0a7c9b6fa3cfd676500db361560db43"
+require LPCore from git "https://github.com/leanprover/lp-core" @ "96d003f40ada9c730ae9fe100716214273be651b"
 
 def macSdkPath : String :=
   "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
@@ -316,9 +316,12 @@ extern_lib soplexffi (pkg) := do
 @[default_target]
 lean_lib SoplexFFI where
   roots := #[`SoplexFFI]
-  globs := #[`SoplexFFI, `SoplexFFI.Basic, `SoplexFFI.Types, `SoplexFFI.Validate]
+  globs := #[`SoplexFFI, `SoplexFFI.Basic]
   precompileModules := !sanitizerEnabled
   moreLinkArgs := soplexRuntimeLinkArgs
 
+/-- End-to-end FFI runtime check (SoPlex version, throw/catch ABI,
+    small LP solve). Doubles as the `lake test` driver. -/
+@[test_driver]
 lean_exe «ffi-check» where
   root := `Main
