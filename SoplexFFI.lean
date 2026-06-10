@@ -3,8 +3,8 @@
 -/
 module
 
-public import SoplexFFI.Types
-public import SoplexFFI.Validate
+public import LPCore.Types
+public import LPCore.Validate
 public import SoplexFFI.Basic
 
 @[expose] public section
