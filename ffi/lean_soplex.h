@@ -45,8 +45,10 @@ int lean_soplex_exception_check(void);
  *  -1  any internal SoPlex error or unhandled status
  *
  * This is intentionally narrow: just enough surface area to exercise the
- * full FFI / link / runtime pipeline end-to-end. The real API lives behind
- * `solveExact` / `solveFloat` and goes in later.
+ * full FFI / link / runtime pipeline end-to-end. The production API
+ * (`solveExact` / `solveFloat`, certificate extraction, MPS / LP file
+ * I/O) lives in `lean_soplex_bridge.cpp` and is exposed on the Lean
+ * side by `SoplexFFI.Basic`.
  */
 int lean_soplex_ffi_check_solve(
     int32_t numVars,

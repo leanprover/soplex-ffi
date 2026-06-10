@@ -18,7 +18,7 @@
 -/
 module
 
-public import SoplexFFI.Validate
+public import LPCore.Validate
 public import Lean
 
 @[expose] public section
@@ -109,16 +109,22 @@ opaque ffiCheckSolveImpl
     |>.push ((u >>> 16) &&& 0xff).toUInt8
     |>.push ((u >>> 24) &&& 0xff).toUInt8
 
+/-- Marshalling helper: flatten sparse indices into the little-endian
+    `ByteArray` the bridge expects. Not intended as public API. -/
 def packUInt32Array (xs : Array UInt32) : ByteArray := Id.run do
   let mut bs := ByteArray.empty
   for x in xs do bs := pushU32LE bs x
   return bs
 
+/-- Marshalling helper: repack an `Array Float` as the unboxed
+    `FloatArray` the `ffiCheckSolve` ABI takes. -/
 def floatArrayOfArray (xs : Array Float) : FloatArray := Id.run do
   let mut a := FloatArray.empty
   for x in xs do a := a.push x
   return a
 
+/-- Marshalling helper: render rationals as the canonical decimal
+    strings (`"n"` or `"n/d"`) the bridge parses with GMP. -/
 def ratStrings (xs : Array Rat) : Array String :=
   xs.map toString
 
@@ -128,15 +134,20 @@ def ratStrings (xs : Array Rat) : Array String :=
 def ratStringsV {n : Nat} (xs : Vector Rat n) : Array String :=
   (xs.map toString).toArray
 
+/-- Marshalling helper: presence mask for optional bounds (1 = bound
+    present, 0 = infinite), paired with `optionRatStrings`. -/
 def optionRatMask {n : Nat} (xs : Vector (Option Rat) n) : ByteArray := Id.run do
   let mut bs := ByteArray.empty
   for x in xs do
     bs := bs.push (if x.isSome then 1 else 0)
   return bs
 
+/-- Marshalling helper: decimal-string rendering of optional bounds;
+    absent bounds render as `"0"` and are ignored via `optionRatMask`. -/
 def optionRatStrings {n : Nat} (xs : Vector (Option Rat) n) : Array String :=
   (xs.map (fun x => x.elim "0" toString)).toArray
 
+/-- Boundary check: a `Nat` must fit the bridge's 32-bit slots. -/
 def checkedU32 (field : String) (n : Nat) :
     Except ProblemError UInt32 :=
   if n ≤ ffiMaxInt then
@@ -144,12 +155,16 @@ def checkedU32 (field : String) (n : Nat) :
   else
     throw (.tooLarge field ffiMaxInt n)
 
+/-- Boundary check: the iteration limit must fit the bridge's 32-bit
+    slot (`OptionError`-flavoured variant of `checkedU32`). -/
 def checkedIterLimit (n : Nat) : Except OptionError UInt32 :=
   if n ≤ ffiMaxInt then
     pure (UInt32.ofNat n)
   else
     throw (.iterLimitTooLarge ffiMaxInt n)
 
+/-- Translate `Options.iterLimit` into the bridge's `(hasLimit, limit)`
+    pair convention (`0` when unlimited). -/
 def ffiIterLimit (opts : Options) : Except SolveError UInt32 :=
   match opts.iterLimit with
   | none => pure 0
@@ -215,7 +230,7 @@ def problemFlatten {m n : Nat} (p : Problem m n) :
 @[extern "lean_soplex_solve_exact"]
 opaque solveExactFlat {m n : Nat}
     (numVars numConstraints : UInt32)
-    (sense simplex : UInt8)
+    (simplex : UInt8)
     (hasTimeLimit : Bool) (timeLimit : Float)
     (hasIterLimit : Bool) (iterLimit : UInt32)
     (verbose : Bool) (randomSeed : UInt32)
@@ -237,10 +252,6 @@ def mapObjectiveForSense {m n : Nat} (sense : ObjSense)
   | .minimize => s
   | .maximize => { s with objective := s.objective.map Neg.neg }
 
-def objSenseTag : ObjSense → UInt8
-  | .minimize => 0
-  | .maximize => 1
-
 def simplexTag : Simplex → UInt8
   | .primal => 0
   | .dual => 1
@@ -258,9 +269,11 @@ opaque solveExact {m n : Nat} (opts : Options) (p : Problem m n) :
   let iterLimit ← ffiIterLimit opts
   let p ← validate p |>.mapError SolveError.invalidProblem
   let f ← problemFlatten (canonicalize opts.sense p) |>.mapError SolveError.invalidProblem
+  -- The LP crossing the FFI is always the minimization canonicalization
+  -- (`canonicalize` above); the bridge has no objective-sense parameter.
   let sol ← solveExactFlat
     f.numVars f.numConstraints
-    (objSenseTag .minimize) (simplexTag opts.simplex)
+    (simplexTag opts.simplex)
     opts.timeLimit.isSome (opts.timeLimit.getD 0.0)
     opts.iterLimit.isSome iterLimit
     opts.verbose opts.randomSeed opts.precisionBoost opts.presolve
@@ -276,7 +289,7 @@ opaque solveExact {m n : Nat} (opts : Options) (p : Problem m n) :
 @[extern "lean_soplex_solve_float"]
 opaque solveFloatFlat {n : Nat}
     (numVars numConstraints : UInt32)
-    (sense simplex : UInt8)
+    (simplex : UInt8)
     (hasTimeLimit : Bool) (timeLimit : Float)
     (hasIterLimit : Bool) (iterLimit : UInt32)
     (verbose : Bool) (randomSeed : UInt32)
@@ -313,7 +326,7 @@ opaque solveFloat {m n : Nat} (opts : Options) (p : Problem m n) :
   let f ← problemFlatten (canonicalize opts.sense p) |>.mapError SolveError.invalidProblem
   let sol ← solveFloatFlat
     f.numVars f.numConstraints
-    (objSenseTag .minimize) (simplexTag opts.simplex)
+    (simplexTag opts.simplex)
     opts.timeLimit.isSome (opts.timeLimit.getD 0.0)
     opts.iterLimit.isSome iterLimit
     opts.verbose opts.randomSeed opts.presolve
@@ -341,7 +354,8 @@ opaque solveFloat {m n : Nat} (opts : Options) (p : Problem m n) :
     as `SolveError.invalidProblem`.
 
   Round-trip equivalence under `validate` is *structural-after-validate*,
-  not permutation-invariant: see `FileIoTests.lean`. Format-specific
+  not permutation-invariant: see `LPTest/FileIo.lean` in the
+  `leanprover/lp` meta-package. Format-specific
   caveats — notably `writeLp` expanding ranged rows into two non-ranged
   rows — are SoPlex format properties, not bridge artefacts. -/
 
