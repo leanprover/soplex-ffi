@@ -2,8 +2,10 @@
  * Lean-callable bridge: unpacks Lean ByteArray / FloatArray inputs, calls
  * into `lean_soplex.cpp`, and packages the result as a Lean ADT.
  *
- * Pattern matches `lean-csdp` exactly: integer arrays are passed as
- * ByteArrays of int32 entries; floating-point arrays as FloatArrays.
+ * Integer index arrays are passed as ByteArrays of int32 entries
+ * (matching `lean-csdp`); floating-point arrays as FloatArrays;
+ * rationals in the packed numerator/denominator wire format described
+ * at `RatBufReader` below, decoded with `mpz_import`.
  *
  * Compiled as C++ because Lean's runtime headers and SoPlex's headers both
  * need a C++ translation unit somewhere; making the bridge itself C++
@@ -71,15 +73,6 @@ static inline const double *float_array_const_ptr(b_lean_obj_arg arr) {
   return lean_float_array_cptr(arr);
 }
 
-static inline uint8_t byte_array_u8(b_lean_obj_arg arr, size_t i) {
-  return lean_sarray_cptr(arr)[i];
-}
-
-static inline std::string lean_string_at(b_lean_obj_arg arr, size_t i) {
-  lean_object *s = lean_array_get_core(arr, i);
-  return std::string(lean_string_cstr(s));
-}
-
 /*
  * RAII redirection of SoPlex's `spxout` to an in-memory buffer.
  *
@@ -145,13 +138,6 @@ class Mpq {
   mpq_t q;
 
   Mpq() { mpq_init(q); }
-  explicit Mpq(const std::string &s) {
-    mpq_init(q);
-    if (mpq_set_str(q, s.c_str(), 10) != 0) {
-      throw std::runtime_error("invalid rational string: " + s);
-    }
-    mpq_canonicalize(q);
-  }
   Mpq(const Mpq &) = delete;
   Mpq &operator=(const Mpq &) = delete;
   Mpq(Mpq &&other) noexcept {
@@ -165,33 +151,81 @@ class Mpq {
   ~Mpq() { mpq_clear(q); }
 };
 
-static lean_object *mk_rat_from_mpq(const mpq_t q) {
-  mpq_t z;
-  mpq_init(z);
-  mpq_set(z, q);
-  mpq_canonicalize(z);
-  char *num = mpz_get_str(nullptr, 10, mpq_numref(z));
-  char *den = mpz_get_str(nullptr, 10, mpq_denref(z));
-  if (num == nullptr || den == nullptr) {
-    mpq_clear(z);
-    throw std::runtime_error("mpz_get_str failed");
+static void init_mpq_vector(std::vector<Mpq> &xs, size_t n) {
+  xs.clear();
+  xs.reserve(n);
+  for (size_t i = 0; i < n; ++i) xs.emplace_back();
+}
+
+// The limb-walking conversions below assume GMP's limbs are 64-bit
+// with no nail bits, true on every platform this package targets
+// (Linux x86_64/aarch64, macOS arm64, Windows x86_64 via MinGW).
+static_assert(sizeof(mp_limb_t) == sizeof(uint64_t),
+              "packed-rational marshalling assumes 64-bit GMP limbs");
+static_assert(GMP_NUMB_BITS == 64,
+              "packed-rational marshalling assumes nail-free 64-bit GMP limbs");
+
+/*
+ * Build a Lean `Nat` holding |z|, straight from GMP's limbs: the top
+ * limb seeds the value and each further limb is folded in with
+ * shift-and-add through the Lean runtime's bignum ops. Single-limb
+ * values (the common case) take the `lean_uint64_to_nat` fast path.
+ * Allocation-free apart from the Lean objects themselves, hence
+ * non-throwing — important for the Lean-object construction phases
+ * below, which rely on not unwinding mid-build.
+ */
+static lean_object *mk_nat_from_mpz_abs(const mpz_t z) {
+  size_t nlimbs = mpz_size(z);
+  if (nlimbs == 0) return lean_box(0);
+  lean_object *n = lean_uint64_to_nat(static_cast<uint64_t>(mpz_getlimbn(z, nlimbs - 1)));
+  if (nlimbs == 1) return n;
+  lean_object *shift = lean_box(64);
+  for (size_t i = nlimbs - 1; i-- > 0;) {
+    lean_object *shifted = lean_nat_shiftl(n, shift);
+    lean_dec(n);
+    lean_object *limb = lean_uint64_to_nat(static_cast<uint64_t>(mpz_getlimbn(z, i)));
+    n = lean_nat_add(shifted, limb);
+    lean_dec(shifted);
+    lean_dec(limb);
   }
+  return n;
+}
+
+static lean_object *mk_int_from_mpz(const mpz_t z) {
+  lean_object *nat = mk_nat_from_mpz_abs(z);
+  lean_object *pos = lean_nat_to_int(nat); // consumes `nat`
+  if (mpz_sgn(z) >= 0) return pos;
+  lean_object *neg = lean_int_neg(pos);
+  lean_dec(pos);
+  return neg;
+}
+
+/*
+ * Build a Lean `Rat` from a canonical `mpq_t`.
+ *
+ * PRECONDITION: `q` is canonical (positive denominator, gcd 1) — the
+ * Lean `Rat` type carries reducedness as an invariant, so handing it a
+ * non-canonical value would be unsound. Every producer in this file
+ * guarantees this: inputs decode from Lean `Rat`s (canonical by
+ * construction), GMP arithmetic preserves canonicity, and SoPlex
+ * getter results are canonicalized in `fetch` / `mk_rat_from_mpq_canon`.
+ */
+static lean_object *mk_rat_from_mpq(const mpq_t q) {
   lean_object *r = lean_alloc_ctor(0, 4, 0);
-  lean_ctor_set(r, 0, lean_cstr_to_int(num));
-  lean_ctor_set(r, 1, lean_cstr_to_nat(den));
+  lean_ctor_set(r, 0, mk_int_from_mpz(mpq_numref(q)));
+  lean_ctor_set(r, 1, mk_nat_from_mpz_abs(mpq_denref(q)));
   lean_ctor_set(r, 2, lean_box(0));
   lean_ctor_set(r, 3, lean_box(0));
-  void (*freefunc)(void *, size_t);
-  mp_get_memory_functions(nullptr, nullptr, &freefunc);
-  freefunc(num, std::strlen(num) + 1);
-  freefunc(den, std::strlen(den) + 1);
-  mpq_clear(z);
   return r;
 }
 
-static lean_object *mk_rat_from_string(const std::string &s) {
-  Mpq q(s);
-  return mk_rat_from_mpq(q.q);
+/* Canonicalizing variant for values whose canonicity we don't control
+ * (SoPlex objective values, file-reader output). */
+static lean_object *mk_rat_from_mpq_canon(const mpq_t q) {
+  Mpq z;
+  mpq_set(z.q, q);
+  mpq_canonicalize(z.q);
+  return mk_rat_from_mpq(z.q);
 }
 
 /*
@@ -209,85 +243,158 @@ static lean_object *mk_rat_from_double(double d) {
 }
 
 /*
- * Parse a Lean-side decimal-string `Rat` to a `double`. Used by the
- * float-mode bridge to feed `addColReal` / `addRowReal`.
+ * Sequential reader for the packed-rational wire format produced by
+ * `pushRatLE` in `SoplexFFI/Basic.lean`. One record per rational:
+ *
+ *   u8  sign      1 = negative numerator, 0 otherwise
+ *   u32 numLen    little-endian byte count of |num|
+ *   ..  num       |num| base-256, least significant byte first,
+ *                 no trailing zero byte; numLen = 0 <=> num = 0
+ *   u32 denLen    same encoding; denLen = 0 <=> den = 1
+ *   ..  den
+ *
+ * Records are canonical by construction on the Lean side (`Rat`
+ * carries reducedness proofs), so no gcd pass happens here; only
+ * structural validity (in-bounds reads, nonzero denominator) is
+ * checked.
  */
-static double parse_rat_to_double(const std::string &s) {
-  Mpq q(s);
-  return mpq_get_d(q.q);
+class RatBufReader {
+ public:
+  explicit RatBufReader(b_lean_obj_arg buf)
+      : p_(lean_sarray_cptr(buf)), end_(p_ + lean_sarray_size(buf)) {}
+
+  void read_mpq(mpq_t q) {
+    uint8_t sign = read_u8();
+    if (sign > 1) throw std::runtime_error("malformed rational buffer (sign byte)");
+    read_mpz(mpq_numref(q));
+    uint32_t denLen = read_u32();
+    if (denLen > 0) {
+      read_mpz_bytes(mpq_denref(q), denLen);
+      if (mpz_sgn(mpq_denref(q)) == 0) {
+        throw std::runtime_error("malformed rational buffer (zero denominator)");
+      }
+    }
+    if (sign) mpz_neg(mpq_numref(q), mpq_numref(q));
+  }
+
+  void expect_end() const {
+    if (p_ != end_) throw std::runtime_error("malformed rational buffer (trailing bytes)");
+  }
+
+ private:
+  uint8_t read_u8() {
+    need(1);
+    return *p_++;
+  }
+  uint32_t read_u32() {
+    need(4);
+    uint32_t v = static_cast<uint32_t>(p_[0]) | (static_cast<uint32_t>(p_[1]) << 8) |
+                 (static_cast<uint32_t>(p_[2]) << 16) | (static_cast<uint32_t>(p_[3]) << 24);
+    p_ += 4;
+    return v;
+  }
+  void read_mpz(mpz_t z) { read_mpz_bytes(z, read_u32()); }
+  void read_mpz_bytes(mpz_t z, uint32_t len) {
+    if (len == 0) {
+      mpz_set_ui(z, 0);
+      return;
+    }
+    need(len);
+    mpz_import(z, len, /*order=*/-1, /*size=*/1, /*endian=*/0, /*nails=*/0, p_);
+    p_ += len;
+  }
+  void need(size_t n) const {
+    if (static_cast<size_t>(end_ - p_) < n) {
+      throw std::runtime_error("malformed rational buffer (truncated)");
+    }
+  }
+
+  const uint8_t *p_;
+  const uint8_t *end_;
+};
+
+/* Decode a buffer of exactly `count` packed rationals. */
+static std::vector<Mpq> decode_rat_array(b_lean_obj_arg buf, size_t count) {
+  RatBufReader reader(buf);
+  std::vector<Mpq> out;
+  init_mpq_vector(out, count);
+  for (size_t i = 0; i < count; ++i) reader.read_mpq(out[i].q);
+  reader.expect_end();
+  return out;
 }
 
-struct FlatProblemInput {
+/* Decode a buffer holding a single packed rational (`objOffset`). */
+static Mpq decode_rat(b_lean_obj_arg buf) {
+  RatBufReader reader(buf);
+  Mpq q;
+  reader.read_mpq(q.q);
+  reader.expect_end();
+  return q;
+}
+
+/*
+ * All problem data, decoded from the Lean buffers exactly once. The
+ * bound vectors always have full row / column length; entries whose
+ * mask bit is 0 decode as zero and are never read. Keeping the decoded
+ * `Mpq`s here lets the certificate-extraction paths
+ * (`bound_combination_sign`, `compute_at_y`) reuse them instead of
+ * re-parsing.
+ */
+struct DecodedProblem {
   int numVars;
   int numConstraints;
   size_t nnz;
   const int32_t *aRows;
   const int32_t *aCols;
-  b_lean_obj_arg c;
-  b_lean_obj_arg aVals;
-  b_lean_obj_arg rowLoMask;
-  b_lean_obj_arg rowLo;
-  b_lean_obj_arg rowHiMask;
-  b_lean_obj_arg rowHi;
-  b_lean_obj_arg colLoMask;
-  b_lean_obj_arg colLo;
-  b_lean_obj_arg colHiMask;
-  b_lean_obj_arg colHi;
+  const uint8_t *rowLoMask;
+  const uint8_t *rowHiMask;
+  const uint8_t *colLoMask;
+  const uint8_t *colHiMask;
+  std::vector<Mpq> c;
+  std::vector<Mpq> aVals;
+  std::vector<Mpq> rowLo;
+  std::vector<Mpq> rowHi;
+  std::vector<Mpq> colLo;
+  std::vector<Mpq> colHi;
 };
 
-static FlatProblemInput flat_problem_input(
+static const uint8_t *mask_ptr(b_lean_obj_arg mask, size_t expected, const char *what) {
+  if (lean_sarray_size(mask) != expected) {
+    throw std::runtime_error(std::string("bound mask has wrong length: ") + what);
+  }
+  return lean_sarray_cptr(mask);
+}
+
+static DecodedProblem decode_problem(
     uint32_t numVars_u, uint32_t numConstraints_u,
-    b_lean_obj_arg c_arr,
-    b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_arr,
+    b_lean_obj_arg c_buf,
+    b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_buf,
     b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
     b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
     b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
     b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) {
-  return FlatProblemInput{
-      static_cast<int>(numVars_u),
-      static_cast<int>(numConstraints_u),
-      lean_sarray_size(a_rows_arr) / sizeof(int32_t),
-      byte_array_as_i32(a_rows_arr),
-      byte_array_as_i32(a_cols_arr),
-      c_arr,
-      a_vals_arr,
-      rowLoMask,
-      rowLo,
-      rowHiMask,
-      rowHi,
-      colLoMask,
-      colLo,
-      colHiMask,
-      colHi};
-}
-
-struct RationalProblemData {
-  std::vector<Mpq> cVals;
-  std::vector<Mpq> aVals;
-  std::vector<std::vector<int>> rowIdx;
-  std::vector<std::vector<size_t>> rowValIdx;
-};
-
-static RationalProblemData parse_rational_problem_data(const FlatProblemInput &in) {
-  RationalProblemData data;
-  data.cVals.reserve(in.numVars);
-  for (int j = 0; j < in.numVars; ++j) data.cVals.emplace_back(lean_string_at(in.c, j));
-
-  data.aVals.reserve(in.nnz);
-  for (size_t k = 0; k < in.nnz; ++k) data.aVals.emplace_back(lean_string_at(in.aVals, k));
-
-  data.rowIdx.resize(in.numConstraints);
-  data.rowValIdx.resize(in.numConstraints);
-  for (size_t k = 0; k < in.nnz; ++k) {
-    int r = in.aRows[k];
-    int col = in.aCols[k];
-    if (r < 0 || r >= in.numConstraints || col < 0 || col >= in.numVars) {
-      throw std::runtime_error("sparse index out of range");
-    }
-    data.rowIdx[r].push_back(col);
-    data.rowValIdx[r].push_back(k);
+  DecodedProblem dp;
+  dp.numVars = static_cast<int>(numVars_u);
+  dp.numConstraints = static_cast<int>(numConstraints_u);
+  dp.nnz = lean_sarray_size(a_rows_arr) / sizeof(int32_t);
+  if (lean_sarray_size(a_cols_arr) != lean_sarray_size(a_rows_arr)) {
+    throw std::runtime_error("sparse row / column index buffers differ in length");
   }
-  return data;
+  dp.aRows = byte_array_as_i32(a_rows_arr);
+  dp.aCols = byte_array_as_i32(a_cols_arr);
+  size_t m = static_cast<size_t>(dp.numConstraints);
+  size_t n = static_cast<size_t>(dp.numVars);
+  dp.rowLoMask = mask_ptr(rowLoMask, m, "rowLo");
+  dp.rowHiMask = mask_ptr(rowHiMask, m, "rowHi");
+  dp.colLoMask = mask_ptr(colLoMask, n, "colLo");
+  dp.colHiMask = mask_ptr(colHiMask, n, "colHi");
+  dp.c = decode_rat_array(c_buf, n);
+  dp.aVals = decode_rat_array(a_vals_buf, dp.nnz);
+  dp.rowLo = decode_rat_array(rowLo, m);
+  dp.rowHi = decode_rat_array(rowHi, m);
+  dp.colLo = decode_rat_array(colLo, n);
+  dp.colHi = decode_rat_array(colHi, n);
+  return dp;
 }
 
 static void add_rational_col(SoPlex &solver, const LPColRational &col) {
@@ -307,77 +414,59 @@ static void add_rational_row(SPxLPRational &lp, const LPRowRational &row) {
 }
 
 template <typename Lp>
-static RationalProblemData build_rational_lp(Lp &lp, const FlatProblemInput &in) {
-  RationalProblemData data = parse_rational_problem_data(in);
+static void build_rational_lp(Lp &lp, const DecodedProblem &dp) {
+  std::vector<std::vector<int>> rowIdx(dp.numConstraints);
+  std::vector<std::vector<size_t>> rowValIdx(dp.numConstraints);
+  for (size_t k = 0; k < dp.nnz; ++k) {
+    int r = dp.aRows[k];
+    int col = dp.aCols[k];
+    if (r < 0 || r >= dp.numConstraints || col < 0 || col >= dp.numVars) {
+      throw std::runtime_error("sparse index out of range");
+    }
+    rowIdx[r].push_back(col);
+    rowValIdx[r].push_back(k);
+  }
+
   DSVectorRational emptyCol(0);
-  for (int j = 0; j < in.numVars; ++j) {
-    Rational obj(data.cVals[j].q);
-    Rational lo = byte_array_u8(in.colLoMask, j)
-        ? Rational(Mpq(lean_string_at(in.colLo, j)).q)
-        : -Rational(infinity);
-    Rational hi = byte_array_u8(in.colHiMask, j)
-        ? Rational(Mpq(lean_string_at(in.colHi, j)).q)
-        : Rational(infinity);
+  for (int j = 0; j < dp.numVars; ++j) {
+    Rational obj(dp.c[j].q);
+    Rational lo = dp.colLoMask[j] ? Rational(dp.colLo[j].q) : -Rational(infinity);
+    Rational hi = dp.colHiMask[j] ? Rational(dp.colHi[j].q) : Rational(infinity);
     add_rational_col(lp, LPColRational(obj, emptyCol, hi, lo));
   }
 
-  for (int i = 0; i < in.numConstraints; ++i) {
-    Rational lo = byte_array_u8(in.rowLoMask, i)
-        ? Rational(Mpq(lean_string_at(in.rowLo, i)).q)
-        : -Rational(infinity);
-    Rational hi = byte_array_u8(in.rowHiMask, i)
-        ? Rational(Mpq(lean_string_at(in.rowHi, i)).q)
-        : Rational(infinity);
-    DSVectorRational vals(static_cast<int>(data.rowIdx[i].size()));
-    for (size_t t = 0; t < data.rowIdx[i].size(); ++t) {
-      vals.add(data.rowIdx[i][t], Rational(data.aVals[data.rowValIdx[i][t]].q));
+  for (int i = 0; i < dp.numConstraints; ++i) {
+    Rational lo = dp.rowLoMask[i] ? Rational(dp.rowLo[i].q) : -Rational(infinity);
+    Rational hi = dp.rowHiMask[i] ? Rational(dp.rowHi[i].q) : Rational(infinity);
+    DSVectorRational vals(static_cast<int>(rowIdx[i].size()));
+    for (size_t t = 0; t < rowIdx[i].size(); ++t) {
+      vals.add(rowIdx[i][t], Rational(dp.aVals[rowValIdx[i][t]].q));
     }
     add_rational_row(lp, LPRowRational(lo, vals, hi));
   }
-  return data;
 }
 
-static void build_real_lp(SoPlex &solver, const FlatProblemInput &in) {
-  std::vector<double> cVals;
-  cVals.reserve(in.numVars);
-  for (int j = 0; j < in.numVars; ++j) {
-    cVals.push_back(parse_rat_to_double(lean_string_at(in.c, j)));
-  }
-
-  std::vector<double> aVals;
-  aVals.reserve(in.nnz);
-  for (size_t k = 0; k < in.nnz; ++k) {
-    aVals.push_back(parse_rat_to_double(lean_string_at(in.aVals, k)));
-  }
-
+static void build_real_lp(SoPlex &solver, const DecodedProblem &dp) {
   DSVector emptyCol(0);
-  for (int j = 0; j < in.numVars; ++j) {
-    double lo = byte_array_u8(in.colLoMask, j)
-        ? parse_rat_to_double(lean_string_at(in.colLo, j))
-        : -infinity;
-    double hi = byte_array_u8(in.colHiMask, j)
-        ? parse_rat_to_double(lean_string_at(in.colHi, j))
-        : infinity;
-    solver.addColReal(LPCol(cVals[j], emptyCol, hi, lo));
+  for (int j = 0; j < dp.numVars; ++j) {
+    double lo = dp.colLoMask[j] ? mpq_get_d(dp.colLo[j].q) : -infinity;
+    double hi = dp.colHiMask[j] ? mpq_get_d(dp.colHi[j].q) : infinity;
+    solver.addColReal(LPCol(mpq_get_d(dp.c[j].q), emptyCol, hi, lo));
   }
 
-  std::vector<DSVector> rows(in.numConstraints);
-  for (size_t k = 0; k < in.nnz; ++k) {
-    int r = in.aRows[k];
-    int col = in.aCols[k];
-    if (r < 0 || r >= in.numConstraints || col < 0 || col >= in.numVars) {
+  std::vector<DSVector> rows(dp.numConstraints);
+  for (size_t k = 0; k < dp.nnz; ++k) {
+    int r = dp.aRows[k];
+    int col = dp.aCols[k];
+    if (r < 0 || r >= dp.numConstraints || col < 0 || col >= dp.numVars) {
       throw std::runtime_error("sparse index out of range");
     }
-    rows[r].add(col, aVals[k]);
+    rows[r].add(col, mpq_get_d(dp.aVals[k].q));
   }
 
-  for (int i = 0; i < in.numConstraints; ++i) {
-    double lo = byte_array_u8(in.rowLoMask, i)
-        ? parse_rat_to_double(lean_string_at(in.rowLo, i))
-        : -infinity;
-    double hi = byte_array_u8(in.rowHiMask, i)
-        ? parse_rat_to_double(lean_string_at(in.rowHi, i))
-        : infinity;
+  for (int i = 0; i < dp.numConstraints; ++i) {
+    double lo = dp.rowLoMask[i] ? mpq_get_d(dp.rowLo[i].q) : -infinity;
+    double hi = dp.rowHiMask[i] ? mpq_get_d(dp.rowHi[i].q) : infinity;
     solver.addRowReal(LPRow(lo, rows[i], hi));
   }
 }
@@ -401,16 +490,15 @@ static lean_object *mk_some(lean_object *x) {
   return o;
 }
 
+/* Takes ownership of the four (already-built) Lean arrays. */
 static lean_object *mk_dual_bundle(
-    const std::vector<Mpq> &rowLower,
-    const std::vector<Mpq> &rowUpper,
-    const std::vector<Mpq> &colLower,
-    const std::vector<Mpq> &colUpper) {
+    lean_object *rowLower, lean_object *rowUpper,
+    lean_object *colLower, lean_object *colUpper) {
   lean_object *d = lean_alloc_ctor(0, 4, 0);
-  lean_ctor_set(d, 0, mk_array_from_mpqs(rowLower));
-  lean_ctor_set(d, 1, mk_array_from_mpqs(rowUpper));
-  lean_ctor_set(d, 2, mk_array_from_mpqs(colLower));
-  lean_ctor_set(d, 3, mk_array_from_mpqs(colUpper));
+  lean_ctor_set(d, 0, rowLower);
+  lean_ctor_set(d, 1, rowUpper);
+  lean_ctor_set(d, 2, colLower);
+  lean_ctor_set(d, 3, colUpper);
   return d;
 }
 
@@ -452,30 +540,62 @@ static lean_object *mk_except_error(const std::string &msg) {
   return r;
 }
 
-static void init_mpq_vector(std::vector<Mpq> &xs, size_t n) {
-  xs.clear();
-  xs.reserve(n);
-  for (size_t i = 0; i < n; ++i) xs.emplace_back();
+/* Shared literal `(0 : Rat)`; callers `lean_inc` per use. */
+static lean_object *mk_rat_zero() {
+  lean_object *r = lean_alloc_ctor(0, 4, 0);
+  lean_ctor_set(r, 0, lean_box(0)); // num = 0
+  lean_ctor_set(r, 1, lean_box(1)); // den = 1
+  lean_ctor_set(r, 2, lean_box(0));
+  lean_ctor_set(r, 3, lean_box(0));
+  return r;
 }
 
-static std::vector<Mpq> split_pos(const std::vector<Mpq> &signedVals, bool positivePart) {
-  std::vector<Mpq> out;
-  init_mpq_vector(out, signedVals.size());
-  for (size_t i = 0; i < signedVals.size(); ++i) {
-    int cmp = mpq_sgn(signedVals[i].q);
-    if ((positivePart && cmp > 0) || (!positivePart && cmp < 0)) {
-      mpq_set(out[i].q, signedVals[i].q);
-      if (!positivePart) mpq_neg(out[i].q, out[i].q);
+/*
+ * Split a signed multiplier vector into nonnegative (lower, upper)
+ * components by sign, building the two Lean arrays directly — no
+ * intermediate `std::vector<Mpq>` copies. Zero entries share a single
+ * `(0 : Rat)` object.
+ */
+static void mk_split_pos_arrays(const std::vector<Mpq> &signedVals,
+                                lean_object **lowerOut, lean_object **upperOut) {
+  size_t n = signedVals.size();
+  lean_object *lower = lean_alloc_array(n, n);
+  lean_object *upper = lean_alloc_array(n, n);
+  lean_object *zero = mk_rat_zero();
+  Mpq tmp;
+  for (size_t i = 0; i < n; ++i) {
+    int sign = mpq_sgn(signedVals[i].q);
+    lean_object *lo;
+    lean_object *hi;
+    if (sign > 0) {
+      lo = mk_rat_from_mpq(signedVals[i].q);
+      lean_inc(zero);
+      hi = zero;
+    } else if (sign < 0) {
+      mpq_neg(tmp.q, signedVals[i].q);
+      hi = mk_rat_from_mpq(tmp.q);
+      lean_inc(zero);
+      lo = zero;
+    } else {
+      lean_inc(zero);
+      lean_inc(zero);
+      lo = zero;
+      hi = zero;
     }
+    lean_array_cptr(lower)[i] = lo;
+    lean_array_cptr(upper)[i] = hi;
   }
-  return out;
+  lean_dec(zero);
+  *lowerOut = lower;
+  *upperOut = upper;
 }
 
 // Mask-aware Farkas routing: send a signed Farkas multiplier vector into
 // the (lower, upper) slots of `DualBundle`, consulting the bound mask so
 // one-sided rows always populate the slot that actually has a bound.
+// Builds the Lean arrays directly, like `mk_split_pos_arrays`.
 //
-// Why not just split by sign (`split_pos`)? SoPlex's `getDualFarkasRational`
+// Why not just split by sign (`mk_split_pos_arrays`)? SoPlex's `getDualFarkasRational`
 // returns POSITIVE multipliers for one-sided constraints regardless of
 // which bound side they refer to (positive both for `Ax ≤ hi` and
 // `Ax ≥ lo` infeasibilities). For ranged constraints (both bounds
@@ -490,37 +610,61 @@ static std::vector<Mpq> split_pos(const std::vector<Mpq> &signedVals, bool posit
 //   * all multipliers `≥ 0`.
 // Both invariants are preserved here by routing to the present side and
 // taking the absolute value.
-static void route_farkas_by_mask(
+static void mk_farkas_arrays(
     const std::vector<Mpq> &signedY,
-    b_lean_obj_arg loMask, b_lean_obj_arg hiMask,
-    std::vector<Mpq> &outLower, std::vector<Mpq> &outUpper) {
+    const uint8_t *loMask, const uint8_t *hiMask,
+    lean_object **lowerOut, lean_object **upperOut) {
   size_t n = signedY.size();
-  init_mpq_vector(outLower, n);
-  init_mpq_vector(outUpper, n);
+  lean_object *lower = lean_alloc_array(n, n);
+  lean_object *upper = lean_alloc_array(n, n);
+  lean_object *zero = mk_rat_zero();
+  Mpq tmp;
   for (size_t i = 0; i < n; ++i) {
     int sign = mpq_sgn(signedY[i].q);
-    if (sign == 0) continue;
-    bool hasLo = byte_array_u8(loMask, i);
-    bool hasHi = byte_array_u8(hiMask, i);
-    if (hasLo && hasHi) {
+    bool hasLo = loMask[i];
+    bool hasHi = hiMask[i];
+    lean_object *lo = nullptr;
+    lean_object *hi = nullptr;
+    if (sign != 0 && hasLo && hasHi) {
       // Ranged: SoPlex's signed convention is positive→lower, negative→upper.
       if (sign > 0) {
-        mpq_set(outLower[i].q, signedY[i].q);
+        lo = mk_rat_from_mpq(signedY[i].q);
       } else {
-        mpq_set(outUpper[i].q, signedY[i].q);
-        mpq_neg(outUpper[i].q, outUpper[i].q);
+        mpq_neg(tmp.q, signedY[i].q);
+        hi = mk_rat_from_mpq(tmp.q);
       }
-    } else if (hasLo) {
+    } else if (sign != 0 && hasLo) {
       // One-sided lower: take the magnitude into rowLower.
-      mpq_set(outLower[i].q, signedY[i].q);
-      if (sign < 0) mpq_neg(outLower[i].q, outLower[i].q);
-    } else if (hasHi) {
+      if (sign > 0) {
+        lo = mk_rat_from_mpq(signedY[i].q);
+      } else {
+        mpq_neg(tmp.q, signedY[i].q);
+        lo = mk_rat_from_mpq(tmp.q);
+      }
+    } else if (sign != 0 && hasHi) {
       // One-sided upper: take the magnitude into rowUpper.
-      mpq_set(outUpper[i].q, signedY[i].q);
-      if (sign < 0) mpq_neg(outUpper[i].q, outUpper[i].q);
+      if (sign > 0) {
+        hi = mk_rat_from_mpq(signedY[i].q);
+      } else {
+        mpq_neg(tmp.q, signedY[i].q);
+        hi = mk_rat_from_mpq(tmp.q);
+      }
     }
-    // Free row (no bounds): contribution must be zero — leave as zero.
+    // Free row (no bounds) or zero multiplier: both slots stay zero.
+    if (lo == nullptr) {
+      lean_inc(zero);
+      lo = zero;
+    }
+    if (hi == nullptr) {
+      lean_inc(zero);
+      hi = zero;
+    }
+    lean_array_cptr(lower)[i] = lo;
+    lean_array_cptr(upper)[i] = hi;
   }
+  lean_dec(zero);
+  *lowerOut = lower;
+  *upperOut = upper;
 }
 
 static void negate_all(std::vector<Mpq> &xs) {
@@ -541,29 +685,26 @@ static void compute_at_y(
   mpq_clear(tmp);
 }
 
+/* Bounds come straight from `dp`'s decoded vectors — no re-parsing. */
 static int bound_combination_sign(
     const std::vector<Mpq> &rowSigned, const std::vector<Mpq> &colSigned,
-    b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
-    b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
-    b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
-    b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) {
+    const DecodedProblem &dp) {
   Mpq acc;
   mpq_t tmp;
   mpq_init(tmp);
-  auto add_bound = [&](const Mpq &signedVal, bool lower, const std::string &bound) {
+  auto add_bound = [&](const Mpq &signedVal, bool lower, const Mpq &bound) {
     if ((lower && mpq_sgn(signedVal.q) <= 0) || (!lower && mpq_sgn(signedVal.q) >= 0)) return;
-    Mpq b(bound);
-    mpq_mul(tmp, signedVal.q, b.q);
+    mpq_mul(tmp, signedVal.q, bound.q);
     if (!lower) mpq_neg(tmp, tmp);
     mpq_add(acc.q, acc.q, tmp);
   };
   for (size_t i = 0; i < rowSigned.size(); ++i) {
-    if (byte_array_u8(rowLoMask, i)) add_bound(rowSigned[i], true, lean_string_at(rowLo, i));
-    if (byte_array_u8(rowHiMask, i)) add_bound(rowSigned[i], false, lean_string_at(rowHi, i));
+    if (dp.rowLoMask[i]) add_bound(rowSigned[i], true, dp.rowLo[i]);
+    if (dp.rowHiMask[i]) add_bound(rowSigned[i], false, dp.rowHi[i]);
   }
   for (size_t j = 0; j < colSigned.size(); ++j) {
-    if (byte_array_u8(colLoMask, j)) add_bound(colSigned[j], true, lean_string_at(colLo, j));
-    if (byte_array_u8(colHiMask, j)) add_bound(colSigned[j], false, lean_string_at(colHi, j));
+    if (dp.colLoMask[j]) add_bound(colSigned[j], true, dp.colLo[j]);
+    if (dp.colHiMask[j]) add_bound(colSigned[j], false, dp.colHi[j]);
   }
   int s = mpq_sgn(acc.q);
   mpq_clear(tmp);
@@ -593,7 +734,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
     b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
     b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) noexcept {
   try {
-    const FlatProblemInput input = flat_problem_input(
+    const DecodedProblem input = decode_problem(
         numVars_u, numConstraints_u, c_arr, a_rows_arr, a_cols_arr, a_vals_arr,
         rowLoMask, rowLo, rowHiMask, rowHi, colLoMask, colLo, colHiMask, colHi);
 
@@ -627,7 +768,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
     if (simplex == 0) solver.setIntParam(SoPlex::ALGORITHM, SoPlex::ALGORITHM_PRIMAL);
     if (simplex == 1) solver.setIntParam(SoPlex::ALGORITHM, SoPlex::ALGORITHM_DUAL);
 
-    RationalProblemData lpData = build_rational_lp(solver, input);
+    build_rational_lp(solver, input);
 
     SPxSolver::Status st = solver.optimize();
     uint8_t status = 5; // numericFailure
@@ -655,9 +796,8 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
       case SPxSolver::OPTIMAL:
       case SPxSolver::OPTIMAL_UNSCALED_VIOLATIONS: {
         status = 0;
-        std::ostringstream obj;
-        obj << solver.objValueRational();
-        objective = mk_some(mk_rat_from_string(obj.str()));
+        Rational objVal = solver.objValueRational();
+        objective = mk_some(mk_rat_from_mpq_canon(objVal.backend().data()));
         std::vector<Mpq> x = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getPrimalRational),
           "primal solution");
@@ -668,10 +808,9 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
         std::vector<Mpq> z = fetch(input.numVars,
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getRedCostRational),
           "reduced costs");
-        auto rowLower = split_pos(y, true);
-        auto rowUpper = split_pos(y, false);
-        auto colLower = split_pos(z, true);
-        auto colUpper = split_pos(z, false);
+        lean_object *rowLower, *rowUpper, *colLower, *colUpper;
+        mk_split_pos_arrays(y, &rowLower, &rowUpper);
+        mk_split_pos_arrays(z, &colLower, &colUpper);
         dual = mk_some(mk_dual_bundle(rowLower, rowUpper, colLower, colUpper));
         break;
       }
@@ -681,16 +820,15 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
           static_cast<bool (SoPlex::*)(mpq_t *, const int)>(&SoPlex::getDualFarkasRational),
           "dual Farkas vector");
         std::vector<Mpq> aty;
-        compute_at_y(input.numVars, input.aRows, input.aCols, lpData.aVals, y, aty);
+        compute_at_y(input.numVars, input.aRows, input.aCols, input.aVals, y, aty);
         for (auto &v : aty) mpq_neg(v.q, v.q);
-        if (bound_combination_sign(y, aty, rowLoMask, rowLo, rowHiMask, rowHi,
-                                   colLoMask, colLo, colHiMask, colHi) < 0) {
+        if (bound_combination_sign(y, aty, input) < 0) {
           negate_all(y);
           negate_all(aty);
         }
-        std::vector<Mpq> rowLower, rowUpper, colLower, colUpper;
-        route_farkas_by_mask(y, rowLoMask, rowHiMask, rowLower, rowUpper);
-        route_farkas_by_mask(aty, colLoMask, colHiMask, colLower, colUpper);
+        lean_object *rowLower, *rowUpper, *colLower, *colUpper;
+        mk_farkas_arrays(y, input.rowLoMask, input.rowHiMask, &rowLower, &rowUpper);
+        mk_farkas_arrays(aty, input.colLoMask, input.colHiMask, &colLower, &colUpper);
         dual = mk_some(mk_dual_bundle(rowLower, rowUpper, colLower, colUpper));
         break;
       }
@@ -777,7 +915,7 @@ static lean_object *mk_float_solution(
  * certificate.
  *
  * Marshalling helpers (`Mpq`, `mk_rat_from_mpq`, `mk_array_from_mpqs`,
- * `mk_some` / `mk_none`, `mk_except_*`, `lean_string_at`,
+ * `mk_some` / `mk_none`, `mk_except_*`, `decode_problem`,
  * `byte_array_*`) are shared with `lean_soplex_solve_exact` above.
  */
 extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_float(
@@ -795,7 +933,7 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_float(
     b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
     b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) noexcept {
   try {
-    const FlatProblemInput input = flat_problem_input(
+    const DecodedProblem input = decode_problem(
         numVars_u, numConstraints_u, c_arr, a_rows_arr, a_cols_arr, a_vals_arr,
         rowLoMask, rowLo, rowHiMask, rowHi, colLoMask, colLo, colHiMask, colHi);
 
@@ -970,12 +1108,6 @@ static lean_object *mk_prod2(lean_object *a, lean_object *b) {
   return p;
 }
 
-static std::string rational_to_string(const Rational &r) {
-  std::ostringstream os;
-  os << r;
-  return os.str();
-}
-
 static bool is_neg_infinity(const Rational &r) {
   return r <= Rational(-infinity);
 }
@@ -984,20 +1116,20 @@ static bool is_pos_infinity(const Rational &r) {
   return r >= Rational(infinity);
 }
 
-// Optional<String> representing a finite lower bound: empty string ⇔ none.
-// Decoupled from Lean allocation so we can do all C++-side / GMP-side
-// work (which is the throw-prone half) before any Lean ctor allocation.
-static std::string opt_lower_str(const Rational &r) {
-  return is_neg_infinity(r) ? std::string() : rational_to_string(r);
+// Pull a SoPlex `Rational` out as a canonical `mpq`. SoPlex's readers
+// produce canonical values in practice, but canonicity is load-bearing
+// for the Lean `Rat` invariant, so normalise defensively here (file
+// I/O is not a hot path).
+static Mpq rational_to_mpq(const Rational &r) {
+  Mpq q;
+  mpq_set(q.q, r.backend().data());
+  mpq_canonicalize(q.q);
+  return q;
 }
 
-static std::string opt_upper_str(const Rational &r) {
-  return is_pos_infinity(r) ? std::string() : rational_to_string(r);
-}
-
-// Build an `Option Rat` Lean object from the encoded-string form above.
-static lean_object *mk_opt_rat(const std::string &s, bool present) {
-  return present ? mk_some(mk_rat_from_string(s)) : mk_none();
+// Build an `Option Rat` Lean object; `q` is ignored when absent.
+static lean_object *mk_opt_rat(const Mpq &q, bool present) {
+  return present ? mk_some(mk_rat_from_mpq(q.q)) : mk_none();
 }
 
 // Construct a `LP.Problem` Lean object.
@@ -1037,90 +1169,94 @@ static lean_object *mk_problem(
 // it would also flip the internal storage and re-apply on the next
 // `obj()` call, undoing exactly the change we want.
 //
-// Exception-safety note: every Rational is converted to its decimal
-// string representation in a first pass (this is where GMP / `mpq_get_str`
-// can throw). Only once all strings are in hand do we allocate Lean
-// constructors; from that point on we never throw, so partially built
-// Lean objects cannot leak.
+// Exception-safety note: every Rational is copied out to a canonical
+// `Mpq` in a first pass (this is where GMP work and std::vector
+// allocation, the throw-prone half, happen). Only once all values are
+// in hand do we allocate Lean constructors; `mk_rat_from_mpq` is
+// allocation-free apart from the Lean objects themselves, so from that
+// point on we never throw and partially built Lean objects cannot leak.
 static lean_object *problem_from_lp(SPxLPRat &lp) {
   const bool isMax = (lp.spxSense() == SPxLPRat::MAXIMIZE);
   const int nVars = lp.nCols();
   const int nCons = lp.nRows();
 
-  // Phase 1 — pull every Rational out as a std::string. Throws stay in
-  // this phase, before any Lean allocation has happened.
-  auto signedRat = [&](const Rational &r) -> std::string {
-    return isMax ? rational_to_string(-r) : rational_to_string(r);
+  // Phase 1 — pull every Rational out as a canonical Mpq. Throws stay
+  // in this phase, before any Lean allocation has happened.
+  auto signedRat = [&](const Rational &r) -> Mpq {
+    return isMax ? rational_to_mpq(-r) : rational_to_mpq(r);
+  };
+  // Absent bounds keep a default (zero) Mpq that is never read.
+  auto optRat = [&](const Rational &r, bool present) -> Mpq {
+    return present ? rational_to_mpq(r) : Mpq();
   };
 
-  std::string offsetStr = signedRat(lp.objOffset());
-  std::vector<std::string> cStrs(nVars);
-  for (int j = 0; j < nVars; ++j) cStrs[j] = signedRat(lp.obj(j));
+  Mpq offset = signedRat(lp.objOffset());
+  std::vector<Mpq> cVals;
+  cVals.reserve(nVars);
+  for (int j = 0; j < nVars; ++j) cVals.push_back(signedRat(lp.obj(j)));
 
-  std::vector<std::pair<std::string, std::string>> colBoundStrs(nVars);
+  std::vector<std::pair<Mpq, Mpq>> colBounds;
   std::vector<std::pair<bool, bool>> colBoundPresent(nVars);
+  colBounds.reserve(nVars);
   for (int j = 0; j < nVars; ++j) {
     const Rational &lo = lp.lower(j);
     const Rational &hi = lp.upper(j);
     colBoundPresent[j] = {!is_neg_infinity(lo), !is_pos_infinity(hi)};
-    colBoundStrs[j] = {opt_lower_str(lo), opt_upper_str(hi)};
+    colBounds.emplace_back(optRat(lo, colBoundPresent[j].first),
+                           optRat(hi, colBoundPresent[j].second));
   }
 
-  std::vector<std::pair<std::string, std::string>> rowBoundStrs(nCons);
+  std::vector<std::pair<Mpq, Mpq>> rowBounds;
   std::vector<std::pair<bool, bool>> rowBoundPresent(nCons);
-  // (row, col, value-string) — note the value strings, not Rationals.
-  std::vector<std::tuple<int, int, std::string>> entries;
+  rowBounds.reserve(nCons);
+  std::vector<std::tuple<int, int, Mpq>> entries;
   for (int i = 0; i < nCons; ++i) {
     const Rational &lhs = lp.lhs(i);
     const Rational &rhs = lp.rhs(i);
     rowBoundPresent[i] = {!is_neg_infinity(lhs), !is_pos_infinity(rhs)};
-    rowBoundStrs[i] = {opt_lower_str(lhs), opt_upper_str(rhs)};
+    rowBounds.emplace_back(optRat(lhs, rowBoundPresent[i].first),
+                           optRat(rhs, rowBoundPresent[i].second));
     const SVectorRational &row = lp.rowVector(i);
     for (int k = 0; k < row.size(); ++k) {
-      entries.emplace_back(i, row.index(k), rational_to_string(row.value(k)));
+      entries.emplace_back(i, row.index(k), rational_to_mpq(row.value(k)));
     }
   }
 
   // Phase 2 — pure Lean allocations. lean_alloc_* terminate on OOM
-  // rather than throwing, and `mk_rat_from_string` on a well-formed
-  // decimal string is non-throwing, so partial-allocation leaks are
-  // ruled out.
+  // rather than throwing, and `mk_rat_from_mpq` is non-throwing, so
+  // partial-allocation leaks are ruled out.
   lean_object *cArr = lean_alloc_array(static_cast<size_t>(nVars), static_cast<size_t>(nVars));
-  lean_array_set_size(cArr, static_cast<size_t>(nVars));
   for (int j = 0; j < nVars; ++j) {
-    lean_array_cptr(cArr)[j] = mk_rat_from_string(cStrs[j]);
+    lean_array_cptr(cArr)[j] = mk_rat_from_mpq(cVals[j].q);
   }
 
   lean_object *colB = lean_alloc_array(static_cast<size_t>(nVars), static_cast<size_t>(nVars));
-  lean_array_set_size(colB, static_cast<size_t>(nVars));
   for (int j = 0; j < nVars; ++j) {
-    lean_object *lo = mk_opt_rat(colBoundStrs[j].first, colBoundPresent[j].first);
-    lean_object *hi = mk_opt_rat(colBoundStrs[j].second, colBoundPresent[j].second);
+    lean_object *lo = mk_opt_rat(colBounds[j].first, colBoundPresent[j].first);
+    lean_object *hi = mk_opt_rat(colBounds[j].second, colBoundPresent[j].second);
     lean_array_cptr(colB)[j] = mk_prod2(lo, hi);
   }
 
   lean_object *rowB = lean_alloc_array(static_cast<size_t>(nCons), static_cast<size_t>(nCons));
-  lean_array_set_size(rowB, static_cast<size_t>(nCons));
   for (int i = 0; i < nCons; ++i) {
-    lean_object *lo = mk_opt_rat(rowBoundStrs[i].first, rowBoundPresent[i].first);
-    lean_object *hi = mk_opt_rat(rowBoundStrs[i].second, rowBoundPresent[i].second);
+    lean_object *lo = mk_opt_rat(rowBounds[i].first, rowBoundPresent[i].first);
+    lean_object *hi = mk_opt_rat(rowBounds[i].second, rowBoundPresent[i].second);
     lean_array_cptr(rowB)[i] = mk_prod2(lo, hi);
   }
 
   const size_t nnz = entries.size();
   lean_object *aArr = lean_alloc_array(nnz, nnz);
-  lean_array_set_size(aArr, nnz);
   for (size_t k = 0; k < nnz; ++k) {
     const auto &e = entries[k];
     lean_object *triple = mk_prod2(
         mk_fin_from_int(std::get<0>(e)),
         mk_prod2(mk_fin_from_int(std::get<1>(e)),
-                 mk_rat_from_string(std::get<2>(e))));
+                 mk_rat_from_mpq(std::get<2>(e).q)));
     lean_array_cptr(aArr)[k] = triple;
   }
 
   lean_object *prob = mk_problem(
-      cArr, mk_rat_from_string(offsetStr),
+      cArr, mk_rat_from_mpq(offset.q),
       aArr, rowB, colB);
   // Wrap in `Σ m, Σ n, Problem m n` so `readMpsImpl` / `readLpImpl`
   // can return the dimensions as type-level witnesses.
@@ -1189,7 +1325,7 @@ static lean_obj_res read_lp_file(b_lean_obj_arg path_obj, LpFormat fmt) noexcept
 static lean_obj_res write_lp_file(
     b_lean_obj_arg path_obj,
     uint32_t numVars_u, uint32_t numConstraints_u,
-    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_str,
+    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_buf,
     b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_arr,
     b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
     b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
@@ -1198,7 +1334,7 @@ static lean_obj_res write_lp_file(
     LpFormat fmt) noexcept {
   try {
     const char *path = lean_string_cstr(path_obj);
-    const FlatProblemInput input = flat_problem_input(
+    const DecodedProblem input = decode_problem(
         numVars_u, numConstraints_u, c_arr, a_rows_arr, a_cols_arr, a_vals_arr,
         rowLoMask, rowLo, rowHiMask, rowHi, colLoMask, colLo, colHiMask, colHi);
 
@@ -1218,7 +1354,7 @@ static lean_obj_res write_lp_file(
     // a file whose round-trip is mathematically wrong, so reject up
     // front. Callers can rewrite the offset into an explicit auxiliary
     // variable if they really need it on disk.
-    Mpq off(std::string(lean_string_cstr(objOffset_str)));
+    Mpq off = decode_rat(objOffset_buf);
     if (mpq_sgn(off.q) != 0) {
       return mk_except_error(
           "nonzero objOffset is not supported by SoPlex's MPS / LP writers; "
@@ -1256,13 +1392,13 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_read_lp_ffi(b_lean_obj_arg path_
 extern "C" LEAN_EXPORT lean_obj_res lean_soplex_write_mps_ffi(
     b_lean_obj_arg path_obj,
     uint32_t numVars_u, uint32_t numConstraints_u,
-    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_str,
+    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_buf,
     b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_arr,
     b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
     b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
     b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
     b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) noexcept {
-  return write_lp_file(path_obj, numVars_u, numConstraints_u, c_arr, objOffset_str,
+  return write_lp_file(path_obj, numVars_u, numConstraints_u, c_arr, objOffset_buf,
                        a_rows_arr, a_cols_arr, a_vals_arr,
                        rowLoMask, rowLo, rowHiMask, rowHi,
                        colLoMask, colLo, colHiMask, colHi, LpFormat::MPS);
@@ -1271,13 +1407,13 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_write_mps_ffi(
 extern "C" LEAN_EXPORT lean_obj_res lean_soplex_write_lp_ffi(
     b_lean_obj_arg path_obj,
     uint32_t numVars_u, uint32_t numConstraints_u,
-    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_str,
+    b_lean_obj_arg c_arr, b_lean_obj_arg objOffset_buf,
     b_lean_obj_arg a_rows_arr, b_lean_obj_arg a_cols_arr, b_lean_obj_arg a_vals_arr,
     b_lean_obj_arg rowLoMask, b_lean_obj_arg rowLo,
     b_lean_obj_arg rowHiMask, b_lean_obj_arg rowHi,
     b_lean_obj_arg colLoMask, b_lean_obj_arg colLo,
     b_lean_obj_arg colHiMask, b_lean_obj_arg colHi) noexcept {
-  return write_lp_file(path_obj, numVars_u, numConstraints_u, c_arr, objOffset_str,
+  return write_lp_file(path_obj, numVars_u, numConstraints_u, c_arr, objOffset_buf,
                        a_rows_arr, a_cols_arr, a_vals_arr,
                        rowLoMask, rowLo, rowHiMask, rowHi,
                        colLoMask, colLo, colHiMask, colHi, LpFormat::LP);
