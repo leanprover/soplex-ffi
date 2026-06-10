@@ -1,11 +1,11 @@
 /*
  * lean_soplex.cpp — thin C++ glue from the plain-C bridge ABI to SoPlex.
  *
- * Scope today is intentionally narrow: a version accessor plus a toy LP
- * solve that exercises SoPlex enough to verify the build / link / runtime
- * pipeline on every CI platform. The real exact-mode API (and certificate
- * extraction) lives behind a separate set of entry points and lands in a
- * subsequent commit.
+ * Scope is intentionally narrow: a version accessor plus a toy LP solve
+ * that exercises SoPlex enough to verify the build / link / runtime
+ * pipeline on every CI platform (`lake exe ffi-check`). The production
+ * exact-mode API and certificate extraction live in
+ * `lean_soplex_bridge.cpp`.
  *
  * Every entry point is `noexcept` and translates C++ exceptions into a
  * negative return code. No C++ exception is ever permitted to cross the
