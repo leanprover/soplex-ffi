@@ -824,8 +824,9 @@ extern "C" LEAN_EXPORT lean_obj_res lean_soplex_solve_exact(
         // contract in lp-core), so add it here in exact arithmetic.
         // GMP's mpq functions require canonical operands, and SoPlex's
         // value is not guaranteed canonical, so canonicalize first.
+        Rational soplexObj = solver.objValueRational();
         Mpq objVal;
-        mpq_set(objVal.q, solver.objValueRational().backend().data());
+        mpq_set(objVal.q, soplexObj.backend().data());
         mpq_canonicalize(objVal.q);
         Mpq off = decode_rat(objOffset);
         mpq_add(objVal.q, objVal.q, off.q);
