@@ -2,6 +2,7 @@
 /build
 /build-soplex
 /build-soplex-sanitize
+/build-gmp
 /vendor/mingw-libs
 *.swp
 .DS_Store
