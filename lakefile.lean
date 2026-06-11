@@ -60,14 +60,27 @@ def soplexRuntimeLinkArgs : Array String :=
       "-lc++"]
   else if System.Platform.isWindows then
     let mingwLibDir := packageRoot / "vendor" / "mingw-libs"
+    -- `libmingw32.a` carries the MinGW crt_handler members
+    -- (`_gnu_exception_handler`, `__mingw_oldexcpt_handler`) that the staged
+    -- `libstdc++.a` / `libmingwex.a` started referencing after MSYS2 runner
+    -- drift in mid-2026 — without it, `ld.lld` reports those symbols as
+    -- undefined. The MinGW static cluster is wrapped in
+    -- `--start-group`/`--end-group` so the linker repeatedly scans these
+    -- archives for cross-references (e.g. `libmingwex`'s reference back to
+    -- `libmingw32`'s crt_handler), which a single-pass scan would miss. See
+    -- https://github.com/leanprover/soplex-ffi/issues/18 and
+    -- https://github.com/leanprover/lp/issues/170.
     #["-Wl,--allow-multiple-definition",
+      s!"-L{mingwLibDir}",
+      "-Wl,--start-group",
       (mingwLibDir / "libstdc++.a").toString,
       (mingwLibDir / "libgmpxx.a").toString,
       (mingwLibDir / "libgmp.a").toString,
-      s!"-L{mingwLibDir}",
+      (mingwLibDir / "libmingw32.a").toString,
       "-lgcc_s",
       "-lmingwex",
-      "-lmsvcrt"]
+      "-lmsvcrt",
+      "-Wl,--end-group"]
   else
     -- Toolchain lib dir FIRST (see `leanLibDirArgs`) so `-lc++` binds to the
     -- toolchain libc++; the `-L/usr/lib*` dirs that follow stay for GMP.
@@ -160,7 +173,7 @@ def stageMingwLibs (pkgDir : FilePath) : JobM Unit := do
       let src := srcDir / lib
       if (← src.pathExists) then
         proc {cmd := "cp", args := #[src.toString, (outDir / lib).toString]}
-    for lib in #["libstdc++.a", "libgmpxx.a", "libgmp.a"] do
+    for lib in #["libstdc++.a", "libgmpxx.a", "libgmp.a", "libmingw32.a"] do
       if !(← (outDir / lib).pathExists) then
         error s!"missing required MSYS2 archive: {srcDir / lib}"
 
