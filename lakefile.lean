@@ -37,17 +37,27 @@ def sanitizerArgs : Array String :=
   else
     #[]
 
-/-- The Lean toolchain's own `lib` directory, passed by CI as `-KleanLibDir=...`
-    (`$(lean --print-prefix)/lib`). On Linux the `-L/usr/lib*` dirs below are needed
-    to find GMP, but those dirs also hold Ubuntu's `libc++.so`, and a command-line
-    `-L` is searched before the toolchain's own lib dir, so they shadow the Lean
-    toolchain's libc++ for `-lc++`. Ubuntu's libc++ 18 does not export the C++20
-    symbols (`std::__1::__hash_memory`, `__atomic_wait_native`) that the
-    toolchain-built `libleanrt.a`/`libleancpp.a` reference (the toolchain's own
-    libc++ does), so the shadow breaks the link on v4.31. Putting the toolchain lib
-    dir first restores the toolchain libc++ while leaving GMP resolvable. -/
+/- Workspace-root packages can read the lib dir from `-KleanLibDir=...`, but
+   `-K` flags do not propagate to dependency packages, so a downstream
+   consumer building this package transitively (e.g. `leanprover/lp`) cannot
+   reach `get_config?` from its own CI. The `LEAN_LIB_DIR` env var is the
+   fallback: a workspace-global channel that the consumer's CI sets alongside
+   its `lake build` invocation, read here at module init time via the standard
+   `@[init]` pattern. See https://github.com/leanprover/lp/issues/170. -/
+@[init IO.getEnv "LEAN_LIB_DIR"]
+private opaque leanLibDirFromEnv : Option String
+
+/-- The Lean toolchain's own `lib` directory. On Linux the `-L/usr/lib*` dirs
+    in the link line below are needed for the libc/libm side of the link, but
+    those dirs also hold Ubuntu's `libc++.so` and (post-#19) a non-PIC
+    `libgmp.a`, and a command-line `-L` is searched before the toolchain's
+    own lib dir, so they would shadow the toolchain's libc++ for `-lc++` and
+    its PIC `libgmp.a` for `-l:libgmp.a`. Putting `-L<toolchain lib>` first
+    restores the toolchain archives while leaving the rest resolvable. The
+    value comes from `-KleanLibDir=...` when this package is the workspace
+    root, or from `LEAN_LIB_DIR` when it is built as a transitive dep. -/
 def leanLibDirArgs : Array String :=
-  match get_config? leanLibDir with
+  match (get_config? leanLibDir).orElse fun _ => leanLibDirFromEnv with
   | some d => #[s!"-L{d}"]
   | none => #[]
 
