@@ -83,13 +83,31 @@ def soplexRuntimeLinkArgs : Array String :=
       "-Wl,--end-group"]
   else
     -- Toolchain lib dir FIRST (see `leanLibDirArgs`) so `-lc++` binds to the
-    -- toolchain libc++; the `-L/usr/lib*` dirs that follow stay for GMP.
+    -- toolchain libc++; the `-L/usr/lib*` dirs that follow are kept for the
+    -- libc/libm side of the sanitizer runtime, but GMP is now resolved out
+    -- of the toolchain's own static archive (named explicitly, ahead of any
+    -- `-L`-derived search), and `--exclude-libs,ALL` hides all archive
+    -- symbols. This is the fix for a SIGSEGV that hit downstream consumers
+    -- once the bridge added direct `mpz_*` calls in v0.2: when
+    -- `libsoplexffi.so` is dlopen'd into `lean`, an unhidden dynamic GMP
+    -- dependency lets the dynamic loader interpose `__gmpz_*` from Lean's
+    -- bundled GMP while `__gmpq_*` continues to bind to the system GMP, so
+    -- `mpq_init` (system) and `mpz_set_ui` (Lean) operate on different
+    -- internal representations and the embedded mpz tries to write through
+    -- a shared read-only limb. The toolchain bundles its own PIC libgmp.a
+    -- precisely because Lean's `Nat` runtime needs it; reusing it here
+    -- means a single GMP across the process. `-l:libgmp.a` forces archive
+    -- selection over any shared `libgmp.so`. `libgmpxx` is dropped: the
+    -- bridge and SoPlex both go through `<gmp.h>` / Boost multiprecision,
+    -- never `<gmpxx.h>`. This requires `-KleanLibDir=$(lean --print-prefix)/lib`
+    -- on CI, which the Linux jobs already pass.
     leanLibDirArgs ++
     #["-L/usr/lib/x86_64-linux-gnu",
       "-L/usr/lib/aarch64-linux-gnu",
       "-L/usr/lib64",
       "-L/usr/lib",
-      "-lgmpxx", "-lgmp",
+      "-l:libgmp.a",
+      "-Wl,--exclude-libs,libgmp.a",
       "-lm"] ++ sanitizerArgs
 
 package SoplexFFI where
@@ -354,3 +372,18 @@ lean_exe «ffi-check» where
 /-- Marshalling benchmark (`lake exe bench [n]`); see `Bench.lean`. -/
 lean_exe bench where
   root := `Bench
+
+/-- In-elaborator FFI smoke check; see `Tests/InElaborator.lean`. The
+    executable test driver (`ffi-check`) links the bridge statically,
+    so it cannot catch regressions that only surface when
+    `libsoplexffi.so` is dlopen'd into `lean`. Building this lib runs
+    the bridge inside the elaborator, matching the usage shape that
+    downstream consumers (notably `by lp`) hit. Kept out of the
+    sanitizer lane because precompiled-module elaboration with
+    sanitizers is not the configuration the regression hides in;
+    `precompileModules := false` to match the toolchain mode the
+    crash reproduces under. -/
+lean_lib InElaboratorTest where
+  roots := #[`Tests.InElaborator]
+  globs := #[`Tests.InElaborator]
+  precompileModules := !sanitizerEnabled
