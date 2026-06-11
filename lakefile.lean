@@ -37,19 +37,25 @@ def sanitizerArgs : Array String :=
   else
     #[]
 
-/-- The Lean toolchain's own `lib` directory, passed by CI as `-KleanLibDir=...`
-    (`$(lean --print-prefix)/lib`). On Linux the `-L/usr/lib*` dirs below are needed
-    to find GMP, but those dirs also hold Ubuntu's `libc++.so`, and a command-line
-    `-L` is searched before the toolchain's own lib dir, so they shadow the Lean
-    toolchain's libc++ for `-lc++`. Ubuntu's libc++ 18 does not export the C++20
-    symbols (`std::__1::__hash_memory`, `__atomic_wait_native`) that the
-    toolchain-built `libleanrt.a`/`libleancpp.a` reference (the toolchain's own
-    libc++ does), so the shadow breaks the link on v4.31. Putting the toolchain lib
-    dir first restores the toolchain libc++ while leaving GMP resolvable. -/
+/-- The Lean toolchain's own `lib` directory, passed by CI as
+    `-KleanLibDir=...` (`$(lean --print-prefix)/lib`). Only the sanitizer
+    lane needs it now (to put the toolchain `libc++` ahead of Ubuntu's
+    on the `-L/usr/lib*` paths the ASan runtime link pulls in); the
+    default Linux block resolves GMP from this package's own
+    vendor-built `build-gmp/.libs/libgmp.a` and does not consult any
+    system or toolchain `libgmp`. -/
 def leanLibDirArgs : Array String :=
   match get_config? leanLibDir with
   | some d => #[s!"-L{d}"]
   | none => #[]
+
+/-- Path to the vendored, statically-linkable, PIC `libgmp.a` produced
+    by `scripts/build-gmp.sh` (see `gmpObjectsTarget`). Used at config-eval
+    time to build absolute paths into the Linux link block; the path is
+    a pure string concatenation, with the file's existence enforced at
+    build time by the `gmpReadyFile` marker target. -/
+def gmpVendorLib : FilePath :=
+  packageRoot / "build-gmp" / "libgmp.a"
 
 def soplexRuntimeLinkArgs : Array String :=
   if System.Platform.isOSX then
@@ -81,34 +87,47 @@ def soplexRuntimeLinkArgs : Array String :=
       "-lmingwex",
       "-lmsvcrt",
       "-Wl,--end-group"]
-  else
-    -- Toolchain lib dir FIRST (see `leanLibDirArgs`) so `-lc++` binds to the
-    -- toolchain libc++; the `-L/usr/lib*` dirs that follow are kept for the
-    -- libc/libm side of the sanitizer runtime, but GMP is now resolved out
-    -- of the toolchain's own static archive (named explicitly, ahead of any
-    -- `-L`-derived search), and `--exclude-libs,ALL` hides all archive
-    -- symbols. This is the fix for a SIGSEGV that hit downstream consumers
-    -- once the bridge added direct `mpz_*` calls in v0.2: when
-    -- `libsoplexffi.so` is dlopen'd into `lean`, an unhidden dynamic GMP
-    -- dependency lets the dynamic loader interpose `__gmpz_*` from Lean's
-    -- bundled GMP while `__gmpq_*` continues to bind to the system GMP, so
-    -- `mpq_init` (system) and `mpz_set_ui` (Lean) operate on different
-    -- internal representations and the embedded mpz tries to write through
-    -- a shared read-only limb. The toolchain bundles its own PIC libgmp.a
-    -- precisely because Lean's `Nat` runtime needs it; reusing it here
-    -- means a single GMP across the process. `-l:libgmp.a` forces archive
-    -- selection over any shared `libgmp.so`. `libgmpxx` is dropped: the
-    -- bridge and SoPlex both go through `<gmp.h>` / Boost multiprecision,
-    -- never `<gmpxx.h>`. This requires `-KleanLibDir=$(lean --print-prefix)/lib`
-    -- on CI, which the Linux jobs already pass.
+  else if sanitizerEnabled then
+    -- Sanitizer lane: the ASan/UBSan runtime link needs the
+    -- `-L/usr/lib*` dirs to find libresolv and friends, but those dirs
+    -- also hold Ubuntu's `libc++.so` and a command-line `-L` is searched
+    -- before the toolchain's own lib dir. Put the toolchain `lib` dir
+    -- (`-KleanLibDir`, set by CI) FIRST via `leanLibDirArgs` so `-lc++`
+    -- still binds to the toolchain's libc++ — Ubuntu's libc++ 18 lacks
+    -- the C++20 symbols (`std::__1::__hash_memory`, `__atomic_wait_native`)
+    -- that the toolchain's `libleanrt.a` / `libleancpp.a` reference, and
+    -- the wrong libc++ surfaces as "undefined symbol" link failures with
+    -- `precompileModules` on v4.31. GMP is still resolved from the
+    -- vendored archive (see the default-lane comment below).
     leanLibDirArgs ++
-    #["-L/usr/lib/x86_64-linux-gnu",
+    #[gmpVendorLib.toString,
+      "-Wl,--exclude-libs,libgmp.a",
+      "-L/usr/lib/x86_64-linux-gnu",
       "-L/usr/lib/aarch64-linux-gnu",
       "-L/usr/lib64",
-      "-L/usr/lib",
-      "-l:libgmp.a",
-      "-Wl,--exclude-libs,libgmp.a",
-      "-lm"] ++ sanitizerArgs
+      "-L/usr/lib"] ++ sanitizerArgs
+  else
+    -- Default Linux lane: GMP is resolved out of the vendored, PIC,
+    -- statically-built archive at `build-gmp/libgmp.a` (see
+    -- `gmpObjectsTarget`), referenced by absolute path. The bridge's
+    -- `__gmpz_*` and `__gmpq_*` calls bind to this single archive at
+    -- link time and `--exclude-libs` hides its symbols from the dynsym
+    -- table, so when `libsoplexffi.so` is dlopen'd into `lean` the
+    -- dynamic loader cannot interpose any GMP symbol from Lean's
+    -- bundled GMP (which would let `__gmpz_*` and `__gmpq_*` resolve
+    -- against different GMP versions and crash inside `mpq_init`'s
+    -- lazy mpz-field initialiser — see soplex-ffi#18). No toolchain or
+    -- system `libgmp` is consulted; nothing in the link depends on
+    -- which Linux distribution we run on, which version of GMP the
+    -- Lean toolchain bundles, or whether either was compiled with
+    -- `-fPIC`.
+    --
+    -- No `-L/usr/lib*` paths are added: that mirrors `lp` and
+    -- `lp-backend-soplex-ffi`, and prevents Ubuntu's `libc++.so` from
+    -- shadowing the toolchain's via `-lc++`. libm resolves through
+    -- clang's default search dirs.
+    #[gmpVendorLib.toString,
+      "-Wl,--exclude-libs,libgmp.a"]
 
 package SoplexFFI where
   moreLinkArgs := soplexRuntimeLinkArgs
@@ -173,6 +192,63 @@ def soplexBuildEnv : JobM (Array (String × Option String)) := do
   if !cxxFlags.isEmpty then
     env := env.push ("CXXFLAGS", some cxxFlags)
   pure env
+
+/-! ## Vendored GMP build.
+
+  GMP is built from the upstream tarball into `<pkgDir>/build-gmp/` by
+  `scripts/build-gmp.sh`. The script handles download (with SHA-256
+  verification), extraction, `./configure --with-pic --disable-shared
+  --enable-static`, and `make`. The resulting `build-gmp/.libs/libgmp.a`
+  is linked into `libsoplexffi.so` by absolute path
+  (`soplexRuntimeLinkArgs`), so the bridge never picks up any system or
+  toolchain `libgmp`. This sidesteps two problems in one go:
+
+  * GMP-version interposition when the bridge is dlopen'd into `lean`
+    (soplex-ffi#18) — the vendored archive provides a single, hidden
+    GMP across the whole `libsoplexffi.so`.
+
+  * Non-PIC objects in system / toolchain `libgmp.a` on x86_64 — the
+    vendored build is forced PIC, so `ld.lld` never sees an
+    `R_X86_64_PC32` relocation that can't appear in a shared object.
+
+  Only Linux uses the vendored build. macOS keeps `-lgmp` (Homebrew
+  GMP, dynamic, no flat-namespace interposition issue) and Windows
+  keeps the staged MSYS2 `libgmp.a` (always PIC by MSYS2 convention). -/
+
+def gmpBuildDir (pkgDir : FilePath) : FilePath :=
+  pkgDir / "build-gmp"
+
+def gmpReadyFile (pkgDir : FilePath) : FilePath :=
+  gmpBuildDir pkgDir / ".ready"
+
+def gmpLibFile (pkgDir : FilePath) : FilePath :=
+  gmpBuildDir pkgDir / "libgmp.a"
+
+/-- Bumping this forces a clean rebuild via the target's pure trace. The
+    SHA-256 baked into `scripts/build-gmp.sh` must match. -/
+def gmpVersion : String := "6.3.0"
+
+def buildGmpObjects (pkgDir : FilePath) : JobM Unit := do
+  IO.FS.createDirAll (gmpBuildDir pkgDir)
+  let buildScript := pkgDir / "scripts" / "build-gmp.sh"
+  if !(← buildScript.pathExists) then
+    error s!"build-gmp script not found at {buildScript}"
+  procSilentUnlessError {
+    cmd := buildScript.toString,
+    args := #[pkgDir.toString],
+    cwd := some pkgDir,
+    env := #[("GMP_VERSION", some gmpVersion)]
+  }
+  if !(← gmpLibFile pkgDir |>.pathExists) then
+    error s!"GMP build did not produce {gmpLibFile pkgDir}"
+
+private def gmpObjectsTarget (pkg : Package) : FetchM (Job FilePath) := do
+  let buildScriptPath := pkg.dir / "scripts" / "build-gmp.sh"
+  let srcTarget ← inputTextFile buildScriptPath
+  buildFileAfterDep (gmpReadyFile pkg.dir) srcTarget fun _ => do
+    addPlatformTrace
+    addPureTrace gmpVersion "gmp-version"
+    buildGmpObjects pkg.dir
 
 def stageMingwLibs (pkgDir : FilePath) : JobM Unit := do
   if System.Platform.isWindows then
@@ -348,7 +424,17 @@ extern_lib soplexffi (pkg) := do
   -- (`getTrace`), so the artifact job must depend on the bridge objects too —
   -- mapping over `soplexReady` alone left the `.a` stale when only a bridge
   -- source changed (the `.o` rebuilt but the archive was replayed from cache).
-  let inputsJob := Job.collectArray (#[soplexReady] ++ bridgeOJobs) "soplexffi inputs"
+  --
+  -- The vendored GMP build is wired in as an additional input on Linux so
+  -- that `build-gmp/.libs/libgmp.a` exists by the time Lake links
+  -- `libsoplexffi.so` (whose `moreLinkArgs` names it by absolute path). On
+  -- macOS / Windows the dependency is harmless: `buildGmpObjects` is only
+  -- consulted there if a build of the Linux link path is requested.
+  let isLinux := !(System.Platform.isOSX || System.Platform.isWindows)
+  let extraDeps ←
+    if isLinux then do let g ← gmpObjectsTarget pkg; pure #[g] else pure #[]
+  let inputsJob :=
+    Job.collectArray (#[soplexReady] ++ bridgeOJobs ++ extraDeps) "soplexffi inputs"
   inputsJob.mapM fun _ => do
     let soplexOs ← listSoplexObjs pkg.dir
     let bridgeOs ← bridgeOsJob.await

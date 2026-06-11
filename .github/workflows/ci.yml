@@ -24,8 +24,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential ninja-build clang \
-            libgmp-dev libgmpxx4ldbl libboost-dev \
+            libboost-dev \
             libc++-dev libc++abi-dev \
+            xz-utils m4 \
             zstd
 
       - name: Install elan and Lean toolchain
@@ -41,7 +42,10 @@ jobs:
           ./scripts/install-toolchain.sh
 
       - name: Build and run ffi-check
-        run: lake exe "-KleanLibDir=$(lean --print-prefix)/lib" ffi-check
+        # GMP is vendored and built by `scripts/build-gmp.sh`, so we no
+        # longer pass `-KleanLibDir`; the resolved `libgmp.a` is named by
+        # absolute path inside `soplexRuntimeLinkArgs`.
+        run: lake exe ffi-check
 
   linux-asan:
     name: Linux ASan/UBSan
@@ -59,8 +63,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake build-essential ninja-build clang llvm \
-            libgmp-dev libgmpxx4ldbl libboost-dev \
+            libboost-dev \
             libc++-dev libc++abi-dev \
+            xz-utils m4 \
             zstd
 
       - name: Install elan and Lean toolchain
