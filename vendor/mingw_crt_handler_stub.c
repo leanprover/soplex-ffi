@@ -16,25 +16,30 @@
  *
  * Pass-through definitions are enough: `_gnu_exception_handler` was the
  * mingw-w64 SEH-to-POSIX-signal translator; returning
- * `EXCEPTION_CONTINUE_SEARCH` lets unhandled exceptions fall through to
- * the OS default handler, which is the right behaviour for downstream
- * consumers that do not install their own handlers. `__mingw_oldexcpt_handler`
- * is a backup of the previous SetUnhandledExceptionFilter result that
- * the CRT only uses if it runs the old handler's tail; it is safe to
- * leave NULL.
+ * `EXCEPTION_CONTINUE_SEARCH` (== 0) lets unhandled exceptions fall
+ * through to the OS default handler. `__mingw_oldexcpt_handler` is a
+ * backup of the previous SetUnhandledExceptionFilter result; leaving it
+ * null is safe.
  *
- * This file is compiled by `stageMingwLibs` in lakefile.lean during the
- * Windows build and dropped next to the staged MSYS2 archives in
- * `vendor/mingw-libs/`. The link-args block in this package and in the
- * mirror copies in `leanprover/lp-backend-soplex-ffi` and `leanprover/lp`
- * names the resulting `.o` so the link resolves the two crt2.o symbols.
+ * This stub is compiled with the Lean toolchain's `clang` (which does
+ * not have MSYS2 headers on its search path), so it deliberately avoids
+ * `#include <windows.h>` — it declares only what the linker needs to
+ * see and matches the WIN64 ABI (where `WINAPI` is a no-op).
+ *
+ * Compiled by `stageMingwLibs` in lakefile.lean during the Windows
+ * build and dropped next to the staged MSYS2 archives in
+ * `vendor/mingw-libs/`. The link-args block in this package and the
+ * mirror copies in `leanprover/lp-backend-soplex-ffi` and
+ * `leanprover/lp` name the resulting `.o` so the link resolves the two
+ * `crt2.o` references.
  */
 
-#include <windows.h>
+/* `PEXCEPTION_POINTERS` is a pointer-to-struct; an opaque `void*`
+   matches the ABI for argument passing. `LONG` is `long` on every
+   mingw-w64 target. */
+void *__mingw_oldexcpt_handler = 0;
 
-LPTOP_LEVEL_EXCEPTION_FILTER __mingw_oldexcpt_handler = NULL;
-
-LONG WINAPI _gnu_exception_handler(EXCEPTION_POINTERS *info) {
+long _gnu_exception_handler(void *info) {
     (void)info;
-    return EXCEPTION_CONTINUE_SEARCH;
+    return 0L; /* EXCEPTION_CONTINUE_SEARCH */
 }
