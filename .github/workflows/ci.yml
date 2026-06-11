@@ -175,31 +175,6 @@ jobs:
           echo "$ELAN_DIR_MSYS/bin" > .elan-path
           echo "$MINGW_PREFIX/bin" >> .elan-path
 
-      - name: Probe libmingw32.a / libmingwex.a contents for crt_handler symbols
-        run: |
-          set -e
-          export PATH="$(paste -sd: .elan-path):$PATH"
-          LEAN_LIB="$(lean --print-libdir 2>/dev/null || lean --print-prefix)/lib"
-          echo "=== MSYS2 mingw prefix: $MINGW_PREFIX"
-          echo "=== Lean lib dir: $LEAN_LIB"
-          for archive in \
-              "$MINGW_PREFIX/lib/libmingw32.a" \
-              "$MINGW_PREFIX/lib/libmingwex.a" \
-              "$MINGW_PREFIX/lib/libmsvcrt.a" \
-              "$MINGW_PREFIX/lib/libmsvcrt-os.a" \
-              "$LEAN_LIB/libmingw32.a" \
-              "$LEAN_LIB/libmingwex.a"; do
-            echo "--- $archive"
-            if [ -f "$archive" ]; then
-              echo "    exists ($(stat -c%s "$archive" 2>/dev/null || wc -c < "$archive") bytes)"
-              nm --defined-only "$archive" 2>/dev/null | grep -E "(_gnu_exception_handler|__mingw_oldexcpt_handler|gnu_exception|oldexcpt)" || echo "    (none of the probe symbols defined)"
-            else
-              echo "    (missing)"
-            fi
-          done
-          echo "=== Lean toolchain lib directory contents"
-          ls -la "$LEAN_LIB" | head -40
-
       - name: Build and run ffi-check
         run: |
           set -e

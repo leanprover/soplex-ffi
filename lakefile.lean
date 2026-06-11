@@ -60,23 +60,23 @@ def soplexRuntimeLinkArgs : Array String :=
       "-lc++"]
   else if System.Platform.isWindows then
     let mingwLibDir := packageRoot / "vendor" / "mingw-libs"
-    -- `libmingw32.a` carries the MinGW crt_handler members
-    -- (`_gnu_exception_handler`, `__mingw_oldexcpt_handler`) that the staged
-    -- `libstdc++.a` / `libmingwex.a` started referencing after MSYS2 runner
-    -- drift in mid-2026 — without it, `ld.lld` reports those symbols as
-    -- undefined. The MinGW static cluster is wrapped in
-    -- `--start-group`/`--end-group` so the linker repeatedly scans these
-    -- archives for cross-references (e.g. `libmingwex`'s reference back to
-    -- `libmingw32`'s crt_handler), which a single-pass scan would miss. See
-    -- https://github.com/leanprover/soplex-ffi/issues/18 and
+    -- The Lean toolchain's `crt2.o` references `_gnu_exception_handler` and
+    -- `__mingw_oldexcpt_handler` — mingw-w64 CRT compatibility symbols that
+    -- recent MSYS2 packages (mid-2026) stopped exporting from `libmingw32.a`,
+    -- so `ld.lld` reports them as undefined when linking any Lean executable
+    -- on Windows. `stageMingwLibs` compiles a tiny pass-through stub
+    -- (`vendor/mingw_crt_handler_stub.c`) to `mingw_crt_handler_stub.o` and
+    -- drops it next to the staged MSYS2 archives; naming it here resolves
+    -- the link. See https://github.com/leanprover/soplex-ffi/issues/18 and
     -- https://github.com/leanprover/lp/issues/170.
     #["-Wl,--allow-multiple-definition",
       s!"-L{mingwLibDir}",
+      (mingwLibDir / "mingw_crt_handler_stub.o").toString,
       "-Wl,--start-group",
       (mingwLibDir / "libstdc++.a").toString,
       (mingwLibDir / "libgmpxx.a").toString,
       (mingwLibDir / "libgmp.a").toString,
-      (mingwLibDir / "libmingw32.a").toString,
+      "-lmingw32",
       "-lgcc_s",
       "-lmingwex",
       "-lmsvcrt",
@@ -176,6 +176,18 @@ def stageMingwLibs (pkgDir : FilePath) : JobM Unit := do
     for lib in #["libstdc++.a", "libgmpxx.a", "libgmp.a", "libmingw32.a"] do
       if !(← (outDir / lib).pathExists) then
         error s!"missing required MSYS2 archive: {srcDir / lib}"
+    -- Compile the mingw-w64 CRT compatibility stub (see
+    -- `vendor/mingw_crt_handler_stub.c`). The Lean toolchain's `crt2.o` still
+    -- references `_gnu_exception_handler` and `__mingw_oldexcpt_handler`,
+    -- which recent MSYS2 packages no longer export from `libmingw32.a`.
+    let stubSrc := pkgDir / "vendor" / "mingw_crt_handler_stub.c"
+    let stubObj := outDir / "mingw_crt_handler_stub.o"
+    if !(← stubSrc.pathExists) then
+      error s!"missing CRT compatibility stub source: {stubSrc}"
+    proc {cmd := "clang",
+          args := #["-c", "-O2", stubSrc.toString, "-o", stubObj.toString]}
+    if !(← stubObj.pathExists) then
+      error s!"CRT compatibility stub did not compile to {stubObj}"
 
 def removeOldSoplexObjs (dir : FilePath) : IO Unit := do
   if (← dir.pathExists) then
